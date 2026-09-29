@@ -1,0 +1,56 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# /root/.local/lib/spark-shim/ssinstall —— 星火商店安装器包装 (2026-09-23 建; 2026-09-24 迁入 spark-shim)
+#
+# 入口: /usr/bin/ssinstall 与 /usr/local/bin/ssinstall 均为软链 → 本文件(非包管理, dpkg -S 查无)。
+#   星火的安装执行器 /opt/spark-store/extras/shell-caller.sh 里【硬编码】调 /usr/bin/ssinstall
+#   (不走 PATH), 所以必须占住 /usr/bin 这个名字。
+# 为什么本体不再直接写在 /usr/bin/ssinstall(2026-09-24 迁移, 防更新覆盖):
+#   spark-store 包的 postinst(configure, 每次安装/升级/重配置)无条件 `ln -s -f 真身 /usr/bin/ssinstall`
+#   (/usr/local/bin/ssinstall 同样), prerm 还 unlink 它 → 那个路径上的东西必然被包冲掉。
+#   本体放 /root/.local/lib/spark-shim/ 升级只丢入口软链, 由同目录 relink.sh 自愈(本脚本开头、结尾各调一次)。
+#   ★为什么落 /root/.local/lib 而不是 /usr/local/lib: 账本 E-AH 的"用户级"判据要求落点在 $HOME 下
+#     (本机桌面用户就是 root), 与 fake-upowerd(/root/.local/bin)同一套习惯; 两者都不归 dpkg 管。
+#   旧版(2026-09-23 那个自包含的 /usr/bin/ssinstall 普通文件, 2128 字节)备份:
+#     /root/工具箱/backup/ssinstall.20260924_161957
+#   ※ probe-all.sh 第 212 行用 `head -3 /usr/bin/ssinstall | grep -qi 包装` 判钩子在不在 ——
+#     head 会跟随软链读到本文件, 第 3 行带"包装"二字, 判定照旧通过(别把第 3 行的"包装"改掉)。
+#   ★真身 /opt/durapps/spark-store/bin/ssinstall 归 spark-store 包所有, 一个字都没动。
+#
+# 干什么:
+#  1) 以私有 PATH 前置 ssinstall-path/(假 who + 假 loginctl)调真身 —— 修 sudo usage 刷屏(账本 E-AE):
+#     真身 273 行 `export user=$(who | awk '{print $1}' | head -n 1)` 在 proot(无 utmp)为空
+#       → 291 行(全局, 每次运行都执行, 连 --help 都会) `sudo -u "" xdg-user-dir DESKTOP` 刷 5 段 usage;
+#     30-34 行同名函数 zenity() 经 get_current_user(先 who, 再 loginctl list-sessions --no-legend 取第3列)同理。
+#     两个假件只在真命令【无输出】时补一行 root; PATH 只作用于真身及其子进程, 零全局副作用。
+#     ⚠ 随之恢复的上游行为: user 解析成 root 后, 真身 283/327 行装完会把应用 .desktop 复制到
+#       /root/Desktop(桌面图标; 之前因 user 为空一直静默失败)。不想要就建这个空文件(星火官方开关):
+#         /root/.config/spark-union/spark-store/ssshell-config-do-not-create-desktop
+#  2) 装完后再触发一次 Electron 自动补丁扫描。为什么需要 —— APT 层的钩子
+#     (/etc/apt/apt.conf.d/99electron-autopatch)只能覆盖走 apt/aptss 的安装; 而真身
+#     `dpkg -i "$deb_path" || aptss install ...` 这条【直接 dpkg -i】的路径 APT 钩子盖不住, 在这里补一刀。
+#
+# ★ autopatch 后台跑且不阻塞(全量扫一次约 9 秒); 绝不回调 apt/dpkg(会死锁)。
+# ★ 退出码必须原样透传: 星火靠它判断安装成功与否, 吞掉会让界面误报成功。
+# 回退: 先删 /root/.local/lib/spark-shim/relink.sh(否则会被自愈改回来), 再
+#       ln -sfn /opt/durapps/spark-store/bin/ssinstall /usr/bin/ssinstall   (/usr/local/bin/ssinstall 同理)
+# ══════════════════════════════════════════════════════════════════════
+set -u
+SHIM=/root/.local/lib/spark-shim
+REAL=/opt/durapps/spark-store/bin/ssinstall
+
+[ -x "$SHIM/relink.sh" ] && "$SHIM/relink.sh"
+[ -x "$REAL" ] || { echo "[✘] 找不到真正的 ssinstall: $REAL"; exit 127; }
+
+PATH="$SHIM/ssinstall-path:$PATH" "$REAL" "$@"
+rc=$?
+
+# 真身可能刚用 dpkg -i 升级了 spark-store 自己(postinst 会把入口改回真身) → 收尾再自愈一次
+[ -x "$SHIM/relink.sh" ] && "$SHIM/relink.sh"
+
+# 装完补一次 Electron 扫描(后台, 不影响退出码/耗时)
+if [ -x /usr/local/bin/electron-autopatch ]; then
+  setsid /usr/local/bin/electron-autopatch >>/tmp/electron-autopatch.log 2>&1 &
+fi
+
+exit $rc

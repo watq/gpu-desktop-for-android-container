@@ -1,0 +1,235 @@
+#!/bin/bash
+# ════════════════════════════════════════════════════════════════
+# startx11 (proot/rootfs 容器侧) —— 连上 Termux:X11 的 :2, 起容器内 xfce4 桌面
+# 生成 2026-09-22
+#
+# ★ 两段式架构(用户口径 + termux-x11 官方 README 一致):
+#     第一段(Termux 宿主): start.sh 里 `termux-x11 :2 &` 起 X server 服务(只起服务,
+#                           前台窗口由用户手动点 Termux:X11 图标, 不用 am start 拉)
+#     第二段(这里, 容器内): startx11          → DISPLAY=:2 + GPU 变量 + startxfce4
+#   ⚠ 历史踩过的坑: 曾经把【Termux 那一版】(shebang 与日志路径都是 $PREFIX)
+#     放进 /usr/local/bin/startx11 → "无法执行:找不到需要的文件" / 日志目录不存在。
+#     两侧必须各有一份、内容不同。这一份是容器版。
+#
+# ★ GPU: 新机 Adreno830v2 + 容器版 Mesa 26.3(KGSL 后端)
+#     用 MESA_LOADER_DRIVER_OVERRIDE=kgsl + TU_DEBUG=noconform
+#     **不要** GALLIUM_DRIVER=zink / ZINK_DESCRIPTORS / LIBGL_KOPPER_DRI2 —— 那是旧机 Adreno725
+#     zink 配方, 已作废(依据 已验证事实 B5 / 清单 N2)
+#   ※ 与 VNC(:1) 的区别: VNC 下强设 kgsl 会 "MESA-LOADER: failed to retrieve device
+#     information" 崩(缺 DRI3, 见 N16), 所以 gpu.sh 里那行是注释掉的。
+#     Termux:X11(:2) 不走 TigerVNC, 是否能吃到 kgsl **正是本脚本要验证的事**。
+#     若这里也崩, 用 --soft 回落软件渲染, 并把结论落账 N16/N14。
+#
+# ★ 不碰 VNC: 本脚本只操作 :2, 不 kill 任何 Xtigervnc(账本铁律12 两套独立)
+#
+# 用法:  startx11           正常启动(kgsl 硬件 GL)
+#        startx11 --soft    回落软件渲染(kgsl 崩时用)
+#        startx11 --check    只检查环境不起桌面
+#        stopx11            停止容器内桌面
+# ════════════════════════════════════════════════════════════════
+set -u
+
+DISP=:2
+LOG=/tmp/xfce-x11.log
+# 同一文件在 Termux 宿主侧的真实路径(/tmp 是 -b .../usr/tmp:/tmp 绑定来的),
+# 方便在 Termux 侧直接 tail, 不用进 proot。
+LOG_TERMUX=/data/data/com.termux/files/usr/tmp/xfce-x11.log
+PIDF=/tmp/xfce-x11.pid
+MODE=normal
+# ★2026-09-23 更正: 默认【保持硬件 GPU】。此前一版默认改软渲染是错的修法(用户否决):
+#   :2 本来就支持 GPU, 退成 llvmpipe 等于把加速丢了, 而且桌面/面板该不显示还是不显示。
+#   实测对照显示真凶另有其人: 硬件模式下 picom(glx 后端)会被 autostart 拉起, 软件模式下
+#   startx11 跳过 picom —— 黑屏跟着 picom 走, 不跟着 GPU 走。查合成器, 别关 GPU。
+#   (--soft 仅作应急回落保留, 不作默认。)
+
+echo "Start Desktop (proot内)"
+case "${1:-}" in
+  --gpu|--hw) MODE=normal ;;
+  --soft)  MODE=soft ;;
+  --check) MODE=check ;;
+  -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "未知参数: $1 (可用 --gpu / --soft / --check)"; exit 1 ;;
+esac
+
+# ── ① 前置: Termux 侧必须先起 X server ──────────────────────
+# termux-x11 的 socket 在 $PREFIX/tmp/.X11-unix, 经 start.sh 的 -b .../usr/tmp:/tmp
+# 映射成容器内 /tmp/.X11-unix (等价于官方要求的 --shared-tmp)
+#
+# ★2026-09-22 改为【轮询等待】而非秒退(GPT 思路 + 实测根因):
+#   坏状态 = termux-x11 helper 进程还活着, 但 X2 socket 消失(Android 把 Termux:X11
+#   前台 Activity 冻结/回收了)。原来一发现没 X2 就 exit 1 → xfce 根本没机会跑, 用户
+#   误以为"xfce 起不来"。现在给 N 秒窗口让你去点 Termux:X11 图标把 Activity 拉回前台。
+#   ※ 不用 am start 自动拉 Activity(用户明确不要) —— 就是等你手动点图标。
+X2=/tmp/.X11-unix/X2
+if [ ! -e "$X2" ]; then
+  echo "[…] 未见 X2 socket —— 请在手机上点开 Termux:X11 图标让前台接管 (等待 ${X11_WAIT:-15}s)…"
+  W=0; MAX=${X11_WAIT:-15}
+  while [ ! -e "$X2" ] && [ "$W" -lt "$MAX" ]; do sleep 1; W=$((W+1)); done
+fi
+if [ ! -e "$X2" ]; then
+  echo "[✘] 等了 ${X11_WAIT:-15}s 仍没有 /tmp/.X11-unix/X2 —— X server 没就绪"
+  echo "    坏状态多半是: helper 进程还在, 但 Termux:X11 前台 Activity 被 Android 冻/杀了(X2 随之消失)。"
+  echo "    → 最稳的办法: 回 Termux 侧重跑  pkill -f termux.x11; termux-x11 :2 -dpi 96 &  再点图标。"
+  echo "    ★ 不要手动 export XDG_RUNTIME_DIR=\$TMPDIR(Termux 已设好, 强改反而起不来)。"
+  echo "    当前 /tmp/.X11-unix/ 内容:"
+  ls -la /tmp/.X11-unix/ 2>/dev/null | sed 's/^/      /'
+  exit 1
+fi
+echo "[OK] 已连接 display $DISP (检测到 X2 socket)"
+
+export DISPLAY="$DISP"
+export XDG_RUNTIME_DIR=/tmp/runtime-root
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null
+
+# ★2026-09-23 用户定调: 只要 X2 socket 在就无脑起桌面, 不做 xdpyinfo 健康检查。
+#   理由: K60 实测从没出现"X2 在却起不出桌面"; 那道 xdpyinfo 门反而可能误判把好桌面挡掉。
+#   X2 存在 = 通; 直接往下起 xfce。
+
+# ── ② 环境: 复用 desktop-env(改一处即可), 与 startvncs 同款做法 ──
+[ -r /root/.config/desktop-env/apps.sh ] && . /root/.config/desktop-env/apps.sh
+# 中文输入法(ibus+libpinyin); 变量必须在起桌面【前】设好, 否则已启动的 GUI 收不到
+if [ -r /root/.config/desktop-env/im.sh ]; then . /root/.config/desktop-env/im.sh; im_start; fi
+if [ -r /root/.config/desktop-env/gpu.sh ]; then
+  . /root/.config/desktop-env/gpu.sh          # VK_ICD / present=mailbox / vblank
+fi
+
+if [ "$MODE" = soft ]; then
+  unset MESA_LOADER_DRIVER_OVERRIDE
+  export LIBGL_ALWAYS_SOFTWARE=1
+  echo "[i] --soft: 强制软件渲染(llvmpipe)"
+else
+  # X11(:2) 路线显式开 kgsl —— gpu.sh 为了 VNC 安全没有全局设, 这里按 display 单独开
+  export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+  export TU_DEBUG=noconform
+  export EGL_PLATFORM=x11
+  export LIBGL_ALWAYS_SOFTWARE=0
+fi
+
+# ── ③ 渲染器自检(起桌面前先问一句, 省得起完才发现是软件的) ──
+# ⚠ 判定依据必须是【renderer / Accelerated 字段】, 不能看 MESA-LOADER 那行。
+#   2026-09-22 实测: "MESA-LOADER: failed to retrieve device information" 是**非致命噪音**,
+#   打完这行照样成功加载 kgsl 并直出 Adreno (TM) 830v1 / Accelerated: yes。
+#   早期版本把它当失败是误判, 已修正。
+if command -v glxinfo >/dev/null 2>&1; then
+  GLXOUT=$(glxinfo -B 2>/dev/null)
+  R=$(printf '%s' "$GLXOUT" | grep -i 'OpenGL renderer string' | cut -d: -f2- | sed 's/^ *//')
+  A=$(printf '%s' "$GLXOUT" | grep -i 'Accelerated' | cut -d: -f2- | sed 's/^ *//')
+  echo "[i] OpenGL renderer : ${R:-未知}"
+  echo "[i] Accelerated     : ${A:-未知}"
+  case "$R" in
+    *llvmpipe*|*softpipe*|*swrast*)
+      echo "[!] 落到软件渲染了。排查: DISPLAY 是否真是 :2 / X server 是否在跑 /"
+      echo "    /dev/kgsl-3d0 是否可读写 / VK_ICD_FILENAMES 是否指向 freedreno_icd.aarch64.json" ;;
+    *Adreno*)
+      echo "[✔] 硬件加速正常 (Freedreno/KGSL 直出)" ;;
+    *zink*)
+      echo "[✔] 硬件加速正常 (经 Zink→Turnip; 想直出把 MESA_LOADER_DRIVER_OVERRIDE=kgsl 设上)" ;;
+  esac
+else
+  echo "[i] 未装 glxinfo, 跳过渲染器自检 (apt install mesa-utils)"
+fi
+
+[ "$MODE" = check ] && { echo "[i] --check: 只检查, 不起桌面"; exit 0; }
+
+# ── ④ 起桌面 ────────────────────────────────────────────────
+# ⚠ 判"是否已有会话"必须【按 display 区分】: VNC(:1) 自己也跑着一个 xfce4-session,
+#   裸 pgrep -f xfce4-session 会把 :1 那个也算进来 → 误报"已在跑"(2026-09-22 踩过)。
+#   改为读 /proc/<pid>/environ 里的 DISPLAY 精确匹配。本机 ps 不可用, 只能走 /proc。
+session_on_display() {   # $1=display, 打印命中的 pid
+  local d pid dp c
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    # 进程可能在 glob 与读取之间退出 → 整段静音, 否则会刷 "没有那个文件或目录"
+    c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
+    case "$c" in
+      xfce4-session*|*/xfce4-session*) ;;
+      *) continue ;;
+    esac
+    dp=$( { tr '\0' '\n' < "$d/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)
+    [ "$dp" = "$1" ] && echo "$pid"
+  done
+}
+
+EXIST=$(session_on_display "$DISP" | head -1)
+if [ -n "$EXIST" ]; then
+  echo "[!] $DISP 上已有 xfce4-session (pid $EXIST); 要重起先执行 stopx11"
+  exit 1
+fi
+
+# ★2026-09-23: 清 :2 上的【孤儿会话残留】—— 反复起桌面/上次没干净退出, 会留下
+#   dbus-launch --exit-with-session / 其 dbus-daemon / at-spi, 它们仍占着 SM 注册,
+#   导致新 xfce4-session 报 "Another session manager is already running" 而秒退。
+#   这里在【确认 :2 没有活的 xfce4-session】后, 只清这些孤儿(按 DISPLAY=:2 + 进程名白名单),
+#   绝不碰 :1 / X2 server / adb / relay-watch / fake-upowerd, 也排除本脚本自身进程树。
+clean_stale_x2() {
+  local p pid c dp self=$$ par=$PPID
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$pid" = "$self" ] && continue
+    [ "$pid" = "$par" ]  && continue
+    c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null ) || continue
+    [ -n "$c" ] || continue
+    dp=$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)
+    [ "$dp" = "$DISP" ] || continue
+    case "$c" in
+      *dbus-launch*|*dbus-daemon*|*at-spi-bus-launcher*|*at-spi2-registryd*|*xfsettingsd*|*xfconfd*|*xfwm4*|*xfdesktop*|*xfce4-panel*|*panel/wrapper*|*picom*|*Thunar\ --daemon*|*xfce4-clipman*)
+        kill "$pid" 2>/dev/null ;;
+    esac
+  done
+  sleep 1
+}
+clean_stale_x2
+
+# dbus-launch 对某些用户不工作, 失败则退回裸 startxfce4(官方 README 也提了这点)
+if command -v dbus-launch >/dev/null 2>&1; then
+  dbus-launch --exit-with-session startxfce4 >"$LOG" 2>&1 &
+else
+  startxfce4 >"$LOG" 2>&1 &
+fi
+echo $! > "$PIDF"
+sleep 4
+
+NEW=$(session_on_display "$DISP" | head -1)
+if [ -n "$NEW" ]; then
+  echo "[OK] XFCE 已在 $DISP 启动 (xfce4-session pid $NEW)"
+  echo "XFCE日志路径:"
+  echo "  proot内:       $LOG"
+  echo "  Termux真实路径: $LOG_TERMUX"
+
+  # ── ⑤ picom 独立合成器 (CFG4) ────────────────────────────────
+  # ★2026-09-22 改为【兜底】: 正常由 /etc/xdg/autostart/picom.desktop → picom-autostart
+  #   (已改成 :2-only 守卫)在 xfce 会话起来时拉起。这里只在【没起来】时补, 避免
+  #   autostart 与本处两个 picom 抢 :2 打架(X error 8 MATCH 的真因)。
+  if [ "$MODE" != soft ] && command -v picom >/dev/null 2>&1; then
+    sleep 2
+    if pgrep -x picom >/dev/null; then
+      echo "[OK] picom 合成器已由 autostart 拉起 (glx/GPU)"
+    else
+      picom --config /root/.config/picom.conf >/tmp/picom-x11.log 2>&1 &
+      sleep 2
+      pgrep -x picom >/dev/null && echo "[OK] picom 合成器已起(兜底, glx/GPU)" \
+        || echo "[!] picom 没起来, 看 /tmp/picom-x11.log; 桌面仍可用(只是无合成会卡)"
+    fi
+  else
+    [ "$MODE" = soft ] && echo "[i] --soft 模式: 跳过 picom(软件渲染下合成无意义)"
+  fi
+
+  # ── ⑥ 电池链路 (给 xfce4 原生 power-manager-plugin 供电量) ──────
+  # proot 无 systemd/udev → 手动拉: fakebat同步 → 系统D-Bus → upowerd。
+  # 需 start.sh 里那行 -b .../fakebat:/sys/class/power_supply 生效(重启容器后)。
+  if [ -x /root/.local/bin/power-stack.sh ]; then
+    /root/.local/bin/power-stack.sh start 2>&1 | sed 's/^/     /'
+  fi
+
+  # 光标同步(2026-09-25): xfsettingsd 只管 XSETTINGS, 不写 Xcursor.* 的 xrdb 资源,
+  # 根窗光标也只在会话启动时定一次 → 不同步的话「设置→鼠标→光标大小」看不出变化。
+  # 该脚本只【读 xfconf】再推给 X 层, xfconf 仍是唯一真源, 不架空原生 GUI 控制。
+  [ -x /root/.config/desktop-env/cursor-sync.sh ] && /root/.config/desktop-env/cursor-sync.sh "$DISP"
+  echo "     切到手机上的 Termux:X11 窗口就能看到桌面"
+  echo "     ※ VNC(:1) 那套不受影响, 两套独立(铁律12)"
+else
+  echo "[✘] $DISP 上没出现 xfce4-session, 日志尾部:"
+  tail -20 "$LOG"
+  exit 1
+fi

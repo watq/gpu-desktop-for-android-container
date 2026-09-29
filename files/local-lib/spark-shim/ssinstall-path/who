@@ -1,0 +1,33 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# /root/.local/lib/spark-shim/ssinstall-path/who —— 假 who (2026-09-24, 见账本 E-AE 补充)
+#
+# 只由 /usr/bin/ssinstall 包装以 PATH=<本目录>:$PATH 前置给真身 ssinstall 及其子进程用;
+#   本目录不在任何全局 PATH 里, 对系统其余部分零影响。
+#
+# 为什么光有假 loginctl 不够(2026-09-24 实测): 真身 ssinstall 有两处【直接】用无参 who 取桌面用户:
+#     第 19 行  get_current_user():  user=$(who | awk '{print $1}' | head -n 1 ...)
+#     第 273 行 全局作用域:          export user=$(who | awk '{print $1}' | head -n 1)
+#   第 273 行不走 loginctl 回退; proot 无 utmp → user="" → 紧接着第 291 行(全局, 每次运行都执行)
+#     export CURRENT_USER_DIR_DESKTOP=$(sudo -u "$user" xdg-user-dir DESKTOP)
+#   就刷 5 段 sudo usage —— 连 `ssinstall --help` 都刷。装完后 283/327 行(建桌面快捷方式)同理。
+#
+# 做什么: 只接管【无参数】的 who:
+#   · 真 who 有输出 → 原样输出真的(环境将来有 utmp 了, 本假件自动失效);
+#   · 真的没输出 → 伪造一行 utmp 风格 NAME LINE TIME, 调用方只取第 1 列 = root。
+#   带任何参数(who -b / who am i / ...) → exec 真 /usr/bin/who, 行为不变。
+# 回退: 删掉本文件即可。
+# ══════════════════════════════════════════════════════════════════════
+REAL=/usr/bin/who
+
+if [ "$#" -eq 0 ]; then
+  out=$("$REAL" 2>/dev/null)
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    printf '%-8s %-12s %s\n' root pts/0 "$(date '+%Y-%m-%d %H:%M')"
+  fi
+  exit 0
+fi
+
+exec "$REAL" "$@"

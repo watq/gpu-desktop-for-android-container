@@ -1,0 +1,31 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# /root/.local/lib/spark-shim/ssinstall-path/loginctl —— 假 loginctl (2026-09-24, 见账本 E-AE)
+#
+# 只由 /usr/bin/ssinstall 包装以 PATH=<本目录>:$PATH 前置给真身 ssinstall 及其子进程用;
+#   本目录不在任何全局 PATH 里, 对系统其余部分零影响。
+#
+# 为什么: 真身 /opt/durapps/spark-store/bin/ssinstall 的 get_current_user() 在 who 为空时回退
+#     user=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | head -n 1)
+#   proot 下没有 systemd → 真 loginctl 报错且无输出 → user="" → `sudo -u ""` 刷 sudo usage。
+#
+# 做什么: 只接管【恰好是 list-sessions --no-legend】这一种调用:
+#   · 真 loginctl 有输出 → 原样输出真的(环境将来有 logind 了, 本假件自动失效);
+#   · 真的没输出 → 伪造一行 systemd 列序 SESSION UID USER SEAT TTY STATE IDLE SINCE,
+#     调用方只取第 3 列(USER) = root(本机桌面用户就是 root)。
+#   其余任何子命令/参数组合 → exec 真 /usr/bin/loginctl, 行为不变。
+# 回退: 删掉本文件即可(ssinstall 包装里的 PATH 前置对不存在的命令无副作用)。
+# ══════════════════════════════════════════════════════════════════════
+REAL=/usr/bin/loginctl
+
+if [ "$#" -eq 2 ] && [ "$1" = "list-sessions" ] && [ "$2" = "--no-legend" ]; then
+  out=$("$REAL" list-sessions --no-legend 2>/dev/null)
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    printf '%7s %4s %-4s %-5s %-5s %-6s %-4s %s\n' 1 0 root - - active no -
+  fi
+  exit 0
+fi
+
+exec "$REAL" "$@"

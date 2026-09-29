@@ -1,0 +1,110 @@
+#!/bin/bash
+# /usr/local/bin/firefox —— Firefox 统一入口包装(账本 N5)
+#
+# 【背景】本机装了三套互不相干的 Firefox, 三个桌面入口各指一套, 于是"有的能播B站有的不能":
+#   1) /usr/bin/firefox-esr                              -> ESR 140.16.0esr  (dpkg: firefox-esr)
+#      profile 根目录: ~/.mozilla/firefox-esr/
+#   2) /opt/firefox/firefox-bin                          -> 156.0.1          (手工安装, 非 dpkg)
+#      profile: ~/.config/mozilla/firefox/k1vp340r.default-release
+#   3) /opt/apps/firefox-spark/files/firefox/firefox-bin -> 148.0.2          (dpkg: firefox-spark)
+#      profile: ~/.config/mozilla/firefox/kukwkXK7.Profile 1
+#   注意 2) 和 3) 共用 ~/.config/mozilla/firefox 这个根, 但 Firefox 按"安装目录哈希"
+#   给每个安装分配**不同** profile —— 所以它们的 cookie/扩展/设置/版本全都不一样。
+#   三个入口统一指向同一个二进制后, 安装哈希一致 -> 自动收敛到同一个 profile, 问题根除。
+#
+# 【选定】/opt/firefox/firefox-bin
+#   理由: 版本最新; ldd 无缺失依赖; 实测能起窗口、能拉起 RDD 媒体解码进程和多个
+#   内容进程; 界面已是中文; 且它自带 Mozilla 官方自动更新 —— 2026-09-24 实测中它
+#   自己从 149.0.2 升到了 156.0.1, 而另外两套是死版本(148 / 140esr 靠 apt)。
+#   所以指向它 = 长期自动保持最新。
+#
+# 【GPU】本机实测结论(与账本 K60 的 MOZ_WEBRENDER=0 相反):
+#   · 什么都不设 -> Firefox 用**软件 WebRender**(进程里根本不映射任何 GPU 驱动)。
+#   · MOZ_WEBRENDER=1 + kgsl 那套 -> **硬件 WebRender**, 实测父进程持有 3 个
+#     /dev/kgsl-3d0 fd, 加载 libGLX_mesa, 且无 llvmpipe。画面正常。
+#   所以这里开硬件, 不再用 MOZ_WEBRENDER=0。
+#   · 但**合成器(WebRender)和网页 WebGL 是两道独立的闸**: 上面那套只解决合成器,
+#     网页里 canvas.getContext('webgl') 仍然拿不到上下文(Firefox 的 GPU 黑名单
+#     把这块 Adreno/freedreno 判为不可用)。必须再加 pref webgl.force-enabled=true
+#     绕过黑名单 —— 实测只要这一个 pref 就够, 加完 WebGL2 正常, UNMASKED_VENDOR
+#     = freedreno, 渲染器 = Adreno。pref 没法用环境变量设, 只能写进 profile,
+#     所以下面 ff_ensure_gpu_prefs() 会幂等地往 profile 的 user.js 里补。
+#
+# 【沙盒】本机**不需要**账本 K60 那组 MOZ_DISABLE_*_SANDBOX:
+#   不设它们 Firefox 照样起得来, 内容进程/RDD 全部正常; 而且实测**关掉沙盒对
+#   WebGL 毫无帮助**(关了照样没上下文), 真正管用的是上面那个 pref。故不设, 保留安全性。
+#   (日志里 "Sandbox: Couldn't list /dev" 与界面上"安全沙盒已禁用"横幅是 proot 下的
+#    固有现象, 不影响使用。)
+#
+# 【开关】
+#   FIREFOX_SW=1          强制软件渲染(GPU 出问题时用)
+#   FIREFOX_NO_PREF_FIX=1 不自动往 profile 写 GPU pref
+#   FIREFOX_BIN=...       临时换用别的二进制(调试/对比用)
+set -u
+
+# 公共函数库: aw_ensure_block(幂等带标记地往配置文件里注入) / aw_prepend
+# 找不到也不致命, 只是少了 WebGL 那一步。
+# shellcheck source=/usr/local/lib/appwrap.sh
+[ -r /usr/local/lib/appwrap.sh ] && . /usr/local/lib/appwrap.sh
+command -v aw_ensure_block >/dev/null 2>&1 || aw_ensure_block() { cat >/dev/null; }
+
+FIREFOX_BIN="${FIREFOX_BIN:-/opt/firefox/firefox-bin}"
+
+if [ ! -x "$FIREFOX_BIN" ]; then
+    # 主二进制没了就按"新->旧"降级, 保证入口永远不会变成死链接
+    for alt in /opt/apps/firefox-spark/files/firefox/firefox-bin /usr/bin/firefox-esr; do
+        [ -x "$alt" ] && { FIREFOX_BIN="$alt"; break; }
+    done
+fi
+[ -x "$FIREFOX_BIN" ] || { echo "firefox-wrapper: 找不到可用的 Firefox 二进制" >&2; exit 127; }
+
+# --- 音频 ---
+export PULSE_SERVER="${PULSE_SERVER:-127.0.0.1}"
+
+# --- 渲染 ---
+if [ "${FIREFOX_SW:-0}" = 1 ]; then
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export MOZ_WEBRENDER=0
+    unset MESA_LOADER_DRIVER_OVERRIDE
+else
+    export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-kgsl}"
+    export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json}"
+    export EGL_PLATFORM="${EGL_PLATFORM:-x11}"
+    export TU_DEBUG="${TU_DEBUG:-noconform}"
+    export MOZ_X11_EGL="${MOZ_X11_EGL:-1}"
+    export MOZ_ACCELERATED="${MOZ_ACCELERATED:-1}"
+    export MOZ_WEBRENDER="${MOZ_WEBRENDER:-1}"
+fi
+
+# --- 6. 网页 WebGL 硬件加速 ---
+# 这是 pref, 环境变量表达不了。三个可行落点实测都能生效, 对比过后选了第一个:
+#   ① profile 的 user.js           —— 在 $HOME 里 = **用户级**; Firefox 自更新不碰 profile,
+#                                      apt 也不碰 => 天然防更新覆盖。缺点: 按 profile 走,
+#                                      新建 profile 不自动继承 -> 靠下面的自愈补上。【选它】
+#   ② <安装目录>/distribution/policies.json —— 自动覆盖所有 profile, 且能只改"默认值"
+#                                      (about:config 仍可改回); 但落在应用目录里,
+#                                      **不是用户级**, 且 Firefox 自更新可能抹掉。
+#   ③ /etc/firefox/policies/policies.json  —— 同样自动覆盖所有 profile 且防自更新,
+#                                      但落在 /etc, 是**系统级**, 超出用户级边界。
+# ②③ 都实测可用, 想要"所有 profile 自动生效"时可以换; 默认按用户级边界走 ①。
+ff_ensure_gpu_pref() {
+    local root d n=0
+    for root in "$HOME/.config/mozilla/firefox" "$HOME/.mozilla/firefox"; do
+        [ -d "$root" ] || continue
+        for d in "$root"/*/; do
+            [ -f "$d/prefs.js" ] || continue        # 只认真正用过的 profile
+            aw_ensure_block "$d/user.js" "firefox-gpu" "//" <<'PREFEOF'
+// 绕过 Firefox GPU 黑名单, 让网页 WebGL 拿到 Adreno 硬件上下文。
+// 不加这行: canvas.getContext("webgl") 返回 null(合成器仍是硬件, 但网页 GL 没有)。
+user_pref("webgl.force-enabled", true);
+PREFEOF
+            n=$((n+1))
+        done
+    done
+    return 0
+}
+if [ "${FIREFOX_SW:-0}" != 1 ] && [ "${FIREFOX_NO_PREF_FIX:-0}" != 1 ]; then
+    ff_ensure_gpu_pref
+fi
+
+exec "$FIREFOX_BIN" "$@"

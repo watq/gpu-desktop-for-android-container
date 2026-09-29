@@ -1,0 +1,70 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# linglong-store 启动 shim (2026-09-24 修订, 用户级防更新覆盖)
+#   /usr/local/bin 在 PATH 里优先于 /usr/bin, 且不被 dpkg 更新覆盖。
+#   配合 ~/.local/share/applications/ 下两个同名 .desktop override(Exec 写绝对路径),
+#   可一次覆盖全部入口: 主菜单图标、og:// 协议唤起、终端直接跑。
+#
+# ★ 它【不是 Electron】, 是 Flutter Linux GTK 应用(lib/libflutter_linux_gtk.so + libapp.so
+#   + data/flutter_assets/)。不要给它加 --no-sandbox —— Flutter 不认这个参数。
+#   (注意: data/icudtl.dat 会让"按 icudtl.dat 判 Electron"的探测误判, Flutter 也用这个文件。)
+#
+# ══════ 本机(proot Ubuntu on Android / Adreno 830)三道坎, 缺一不可 ══════
+#
+# 坎 1: 应用自己回落到软件渲染 → SIGABRT(134)
+#   主程序 linglong_store 读 /proc/cpuinfo 做 CPU 白名单(只认 GenuineIntel / AuthenticAMD),
+#   ARM 必然判定 cpuFallback → g_setenv("FLUTTER_LINUX_RENDERER","software")
+#   → 引擎用 Skia CPU 画布, 但文字是 Impeller 录制的 DlText
+#   → [FATAL] Check failed: blob. "Impeller DlText cannot be drawn to a Skia canvas." → abort。
+#   修: 抢先把 FLUTTER_LINUX_RENDERER 定死成 opengl(decisionSource 变成 environment, 优先级最高)。
+#   ⚠ 引擎只认 opengl / software 两个值, 写 vulkan 会被警告"Unknown renderer type"后改回 opengl。
+#   ⚠ 反向对照: LIBGL_ALWAYS_SOFTWARE=1 会让 EGL context 创建失败 → 同样 abort, 不能走这条路。
+#
+# 坎 2: zink(默认 GL 驱动)在 Xtigervnc(:1) 上起不来 → exit 1
+#   日志: MESA: error: CreateSwapchainKHR failed with VK_ERROR_INITIALIZATION_FAILED
+#         MESA: error: zink: could not create swapchain
+#         Gdk-WARNING: X Window System error 'GLXBadCurrentWindow'
+#   修: 强制走 kgsl 原生驱动(实测 :1/:2 都能出 Adreno (TM) 830v1, GLES 3.2)。
+#
+# 坎 3: Impeller 的 OpenGLESSDF 后端在本机画不出字形图集 → 窗口能开, 但【所有文字和图标全是空白】
+#   (界面只剩色块和按钮轮廓, 用户看着就像"打不开")。字体没问题(fc-list 314 个, CJK 有文泉驿)。
+#   修: LD_PRELOAD 一个垫片拦 fl_dart_project_new(), 拿到 project 后调
+#       fl_dart_project_set_enable_impeller(project, FALSE) → 引擎改用 Skia GL 路径。
+#       日志里 "Using the Impeller rendering backend (OpenGLESSDF)." 那行消失即为生效。
+#       源码: /usr/local/lib/linglong-store/no_impeller.c
+#   (Impeller 全关后不存在"Impeller DlText 画进 Skia 画布"的错配, 坎 1 的 abort 也不会复现。)
+#
+# ⚠ 期望值: 开窗、文字渲染、浏览 UI 都正常。
+# ★2026-09-24 更新(本段旧说法"ll-cli 未装 + bwrap 跑不起来 → 装不了玲珑应用"已被推翻, 见 已验证事实 E-AG):
+#   现有自建轻量实现 /usr/local/bin/ll-cli(不依赖官方 linglong-bin, 也不需要 bwrap),
+#   已实测【下载 + 安装 + 签出 + 生成用户级 desktop】成功(样本 org.deepin.movie)。
+#   → 首屏的"环境检测"若仍提示, 点"跳过此步"照旧可进主界面; 装应用现在走 ll-cli 是可行的。
+#   ※ 签出务必带 --force-copy: proot 下 ostree --user-mode 做不了硬链接, 会退化成 .l2s.* 符号链接,
+#     Qt 的 QDirListing 枚举这种目录返回 0 条 → 误报"找不到 Qt 平台插件 xcb"(E-AG)。
+#   ※ 仍未解决: 深度影院 `ll-cli run org.deepin.movie` 退出码 139 段错误(E-AN, 在查)。
+#   ※ 官方 linglong-bin + bwrap 那条路仍然不通(bwrap 读不到 /proc/sys/kernel/overflowuid),
+#     这是环境硬限制; 上面的轻量实现正是为绕开它而写的。
+# ══════════════════════════════════════════════════════════════════════
+set -u
+
+BIN=/opt/linglong-store/linglong_store
+[ -x "$BIN" ] || { echo "[✘] 找不到 $BIN (玲珑商店没装好?)"; exit 1; }
+
+export DISPLAY="${DISPLAY:-:1}"
+
+# 坎 1
+export FLUTTER_LINUX_RENDERER=opengl
+
+# 坎 2 (设 LINGLONG_STORE_KEEP_DRIVER=1 可跳过, 方便排查)
+if [ -z "${LINGLONG_STORE_KEEP_DRIVER:-}" ]; then
+  export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+  export LIBGL_ALWAYS_SOFTWARE=0
+fi
+
+# 坎 3 (设 LINGLONG_STORE_KEEP_IMPELLER=1 可跳过, 方便排查)
+SHIM_SO=/usr/local/lib/linglong-store/no_impeller.so
+if [ -z "${LINGLONG_STORE_KEEP_IMPELLER:-}" ] && [ -f "$SHIM_SO" ]; then
+  export LD_PRELOAD="${SHIM_SO}${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
+exec "$BIN" "$@"

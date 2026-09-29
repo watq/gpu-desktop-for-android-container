@@ -1,0 +1,164 @@
+#!/bin/bash
+# ════════════════════════════════════════════════════════════════════════════
+# startvnc —— TigerVNC :1 启动(★2026-09-23 起改用 DRI3 硬件 GL 版 Xvnc)
+#
+# ★本轮最大变化: Xvnc 换成自编的 /usr/local/bin/Xtigervnc-dri3
+#   (TigerVNC 1.16.0 + SmithGoll/termux_xserver_dri3 的 lorie DRI3-over-mmap 补丁)
+#   :3 实测结果 —— DRI3/GLX/Present 三扩展齐全, 且:
+#       direct rendering: Yes / Accelerated: yes
+#       OpenGL renderer string: Adreno (TM) 830v1     ← kgsl 原生直出, 不是 zink, 不是 llvmpipe
+#   这推翻了账本里"VNC 只能软件渲染"的旧结论(详见 指引铁律30 / 已验证事实 E-R)。
+#
+# ★为什么不再用 vncserver 包装器:
+#   /usr/share/perl5/TigerVNC/Common.pm 填充 %CMDS 时,
+#     foreach my $dir ($binbase, split(/:/,$ENV{PATH}))
+#   其中 $binbase = vncserver 自己所在目录(/usr/bin), **排在 PATH 之前**。
+#   所以只要 /usr/bin/Xtigervnc 存在, PATH 里放什么都选不上 —— 这也是之前暂存的
+#   /usr/local/bin/Xtigervnc(1.16.2) 一直没被用上的原因。改为直接起 Xvnc(K60 成功配方也是直起)。
+#
+# ★GPU 环境: 用 kgsl 原生 freedreno(实测直出 Adreno 830v1)。
+#   注意与 K60 旧配方的区别: K60 当年用的是 zink 四件套 + -rendernode /dev/kgsl-3d0 + +iglx。
+#   本机【不要】再加 -rendernode —— lorie 补丁已把该选项 #if 0 禁用, DRI3 根本不需要 render node。
+#
+# 用法: startvnc            正常启动(DRI3 硬件 GL)
+#       startvnc --soft     软件渲染回退(硬件出问题时用)
+#       startvnc --legacy   用系统原版 Xtigervnc 1.13.1(完全回到改造前的行为)
+#       stopvnc             停止
+# ════════════════════════════════════════════════════════════════════════════
+set -u
+
+#@VNC-AUTODISPLAY-BEGIN@ —— 自动读取 Termux 探测结果，勿手删
+[ -f /root/.vnc_display.env ] && . /root/.vnc_display.env
+[ -f /tmp/vnc_display.env ]   && . /tmp/vnc_display.env
+: "${VNC_GEOM:=2504x1152}"
+: "${VNC_DPI:=90}"
+#@VNC-AUTODISPLAY-END@
+
+export USER=root
+export HOME=/root
+DISP=:1
+PORT=2864
+XVNC_DRI3=/usr/local/bin/Xtigervnc-dri3
+XVNC_SYS=/usr/bin/Xtigervnc
+LOG=/root/.vnc/startvnc.log
+MODE=normal
+
+case "${1:-}" in
+  --soft)   MODE=soft ;;
+  --legacy) MODE=legacy ;;
+  -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "未知参数: $1 (可用 --soft / --legacy)"; exit 1 ;;
+esac
+
+# ── 幂等: 已经在跑就不重复起(避免把正在用的桌面顶掉) ──
+if [ -e "/tmp/.X11-unix/X${DISP#:}" ]; then
+  running=""
+  for p in /proc/[0-9]*; do
+    c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null ) || continue
+    case "$c" in *Xtigervnc*\ $DISP\ *) running="${p#/proc/}"; break ;; esac
+  done
+  if [ -n "$running" ]; then
+    echo "[i] $DISP 已在运行 (pid $running)。要重起请先 stopvnc"
+    exit 0
+  fi
+  # socket 在但进程没了 = 残留, 清掉
+  rm -f "/tmp/.X11-unix/X${DISP#:}" "/tmp/.X${DISP#:}-lock" 2>/dev/null
+fi
+
+mkdir -p /root/.vnc
+
+# ── 选二进制 ──
+case "$MODE" in
+  legacy) XVNC="$XVNC_SYS";  echo "[i] --legacy: 用系统原版 $(basename "$XVNC") (1.13.1, 软件 GL)" ;;
+  *)      XVNC="$XVNC_DRI3" ;;
+esac
+if [ ! -x "$XVNC" ]; then
+  echo "[!] $XVNC 不可用, 回退系统版 $XVNC_SYS"
+  XVNC="$XVNC_SYS"
+fi
+
+# ── GPU 环境 ──
+# 先取全局 desktop-env(与 :2/startx11 共用一处配置), 再按本脚本需要覆盖。
+[ -r /root/.config/desktop-env/gpu.sh ] && . /root/.config/desktop-env/gpu.sh
+if [ "$MODE" = soft ]; then
+  unset MESA_LOADER_DRIVER_OVERRIDE
+  export LIBGL_ALWAYS_SOFTWARE=1
+  echo "[i] --soft: 强制软件渲染(llvmpipe)"
+elif [ "$XVNC" = "$XVNC_DRI3" ]; then
+  # 只有 DRI3 版才开硬件; 原版 1.13.1 开 kgsl 会 "MESA-LOADER failed" 且无软件回落(旧账本 N16)
+  export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+  export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json
+  export EGL_PLATFORM=x11
+  export TU_DEBUG=noconform
+  export LIBGL_ALWAYS_SOFTWARE=0
+# ★2026-09-24 实测修正: 原为 vblank_mode=3(always sync) —— 那会把【native EGL 路径】
+#   锁死在屏幕刷新率上。glmark2-es2 实测: vblank_mode=3 → 119 分(33 个子项全锁 120FPS/8.31ms),
+#   改成 0 → **1750 分**。zink 走 kopper/WSI 由 MESA_VK_WSI_PRESENT_MODE 管, 不受 vblank_mode
+#   影响 —— 所以带着 vblank_mode=3 做 zink vs kgsl 的 A/B 是无效对比(会得出 zink 反而更快的假象)。
+#   ※ 若出现画面撕裂, 可改回 1(应用请求时同步); 不要再用 3。
+  export vblank_mode=0
+  export MESA_VK_WSI_PRESENT_MODE=mailbox
+  # ★2026-09-24: :1 上 Vulkan 的 X11 present 会失败(vkcube rc=134 /
+  #   CreateSwapchainKHR VK_ERROR_INITIALIZATION_FAILED), 根因是 lorieGetFormats 返回空列表
+  #   → Mesa 退回 DRI3 1.0 → 写死 MOD_INVALID → 被 vncDRI3.c 的 RAW_MMAPPABLE_FD 判定拒绝。
+  #   完整链路与根治改法见 已验证事实 E-AA。这里用唯一有效的绕法: 走 MIT-SHM 呈现。
+  #   代价约 1.8x, 仍是真 GPU 渲染; 附带把 zink 的 swapchain 报错也一并消掉。
+  #   ※ 打完 vncDRI3.c 的 patch 重编 Xvnc 后, 这行就可以删了。:2 原生正常, 不需要设。
+  export MESA_VK_WSI_DEBUG=sw
+else
+  # 原版 Xvnc: 卸掉 kgsl 让它走默认软件 Mesa(硬塞 kgsl 会崩)
+  unset MESA_LOADER_DRIVER_OVERRIDE MESA_VK_WSI_PRESENT_MODE
+fi
+
+# ── 起 Xvnc ──
+echo "[i] $(basename "$XVNC")  $DISP  ${VNC_GEOM}  dpi=${VNC_DPI}  port=${PORT}"
+LD_PRELOAD=/lib/aarch64-linux-gnu/libgcc_s.so.1 \
+"$XVNC" "$DISP" \
+  -localhost=1 \
+  -desktop remote-desktop \
+  -rfbport "$PORT" \
+  -PasswordFile /root/.vnc/passwd \
+  -SecurityTypes VncAuth \
+  -auth /root/.Xauthority \
+  -geometry "$VNC_GEOM" \
+  -depth 24 \
+  -dpi "$VNC_DPI" \
+  >"$LOG" 2>&1 &
+XVNC_PID=$!
+echo "$XVNC_PID" > "/root/.vnc/localhost${DISP}.pid"
+
+# 等 socket
+W=0
+while [ ! -e "/tmp/.X11-unix/X${DISP#:}" ] && [ "$W" -lt 10 ]; do sleep 1; W=$((W+1)); done
+if [ ! -e "/tmp/.X11-unix/X${DISP#:}" ]; then
+  echo "[✘] $DISP 没起来, 日志尾部:"; tail -15 "$LOG"
+  echo "    → 可试 startvnc --legacy 回到原版 1.13.1"
+  exit 1
+fi
+echo "[OK] Xvnc 已启动 (pid $XVNC_PID)"
+
+# ── 渲染器自检(判据是 renderer/Accelerated, 不是 MESA-LOADER 那行噪音) ──
+if command -v glxinfo >/dev/null 2>&1; then
+  R=$(DISPLAY=$DISP glxinfo -B 2>/dev/null | sed -n 's/.*OpenGL renderer string: *//p' | head -1)
+  A=$(DISPLAY=$DISP glxinfo -B 2>/dev/null | sed -n 's/.*Accelerated: *//p' | head -1)
+  echo "[i] OpenGL renderer : ${R:-未知}"
+  echo "[i] Accelerated     : ${A:-未知}"
+  case "$R" in
+    *llvmpipe*|*softpipe*|*swrast*) echo "[!] 落到软件渲染了(若非 --soft 则需排查)" ;;
+    *Adreno*) echo "[✔] 硬件加速正常 (Freedreno/KGSL 直出, 经 DRI3-over-mmap)" ;;
+    *zink*)   echo "[✔] 硬件加速正常 (经 Zink→Turnip)" ;;
+  esac
+fi
+
+# ── 起桌面(沿用 .vnc/xstartup) ──
+if [ -x /root/.vnc/xstartup ]; then
+  DISPLAY=$DISP /root/.vnc/xstartup >/root/.vnc/xstartup.log 2>&1 &
+  sleep 3
+  echo "[OK] 桌面已拉起 (xstartup)"
+else
+  echo "[!] 没有 /root/.vnc/xstartup, 桌面未启动"
+fi
+
+echo "     连接: 127.0.0.1:${PORT}   日志: $LOG"
+echo "     ※ Termux:X11(:2) 不受影响, 两套独立(铁律12)"

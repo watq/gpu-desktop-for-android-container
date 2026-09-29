@@ -1,0 +1,18 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# electron-autopatch-hook —— 包安装后自动触发 Electron 补丁扫描 (2026-09-23)
+#   由 dpkg 的 post-invoke 调用(见 /etc/dpkg/dpkg.cfg.d/99-electron-autopatch)。
+#   因为 apt / aptss(星火商店) / 手动 dpkg -i 最终都要经过 dpkg, 钩在这一层就全覆盖了:
+#     星火商店装的应用、apt 装的、自己 dpkg -i 的, 装完都会自动套上 --no-sandbox 包装。
+#
+# ★ 必须后台跑 + 绝不碰 dpkg: post-invoke 是在 dpkg 事务里被调用的,
+#   若在这里同步跑长任务会拖慢每次安装; 若在这里调 dpkg/apt 会直接死锁。
+#   electron-autopatch 本身只读 .desktop + 写 /root/.local/share/applications, 不调包管理器, 安全。
+# ★ 幂等: electron-autopatch 自己会跳过已处理的, 重复触发无害。
+# ══════════════════════════════════════════════════════════════════════
+BIN=/usr/local/bin/electron-autopatch
+LOG=/tmp/electron-autopatch.log
+[ -x "$BIN" ] || exit 0
+# setsid 脱离 dpkg 进程组, 立即返回, 不阻塞安装
+setsid "$BIN" >>"$LOG" 2>&1 &
+exit 0

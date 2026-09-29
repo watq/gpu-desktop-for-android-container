@@ -1,0 +1,81 @@
+#!/bin/bash
+# ════════════════════════════════════════════════════════════════
+# stopx11 (proot/rootfs 容器侧) —— 只停 Termux:X11(:2) 上的桌面会话
+# 生成 2026-09-22 (历史 stopx11 正文至今没找回, 这是按新机架构新写的)
+#
+# ★ 只动 :2, **绝不碰 :1 的 TigerVNC/XFCE**(账本铁律12: 两套显示服务独立)
+#   停 VNC 那套用 stopvnc。
+# ★ Termux 侧的 X server(termux-x11 进程)不在这里停 —— 那是宿主侧的事:
+#     Termux 执行:  pkill -f termux-x11
+#     或从 Termux:X11 通知栏点 Exit
+#
+# 用法: stopx11          优雅停 :2 的 xfce4-session
+#       stopx11 --force  连整棵进程树一起杀(优雅失败时用)
+# ════════════════════════════════════════════════════════════════
+set -u
+
+DISP=:2
+PIDF=/tmp/xfce-x11.pid
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+# 与 startx11 同款: 按 display 精确找会话(本机 ps 不可用, 走 /proc)
+session_on_display() {
+  local d pid dp c
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
+    case "$c" in
+      xfce4-session*|*/xfce4-session*) ;;
+      *) continue ;;
+    esac
+    dp=$( { tr '\0' '\n' < "$d/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)
+    [ "$dp" = "$1" ] && echo "$pid"
+  done
+}
+
+kill_tree() {   # 历史 .bashrc 里那套, 逻辑照搬(见 recovered 汇编 第五节)
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$child"; done
+  kill -9 "$pid" 2>/dev/null
+}
+
+PIDS=$(session_on_display "$DISP")
+if [ -z "$PIDS" ]; then
+  echo "[i] $DISP 上没有 xfce4-session, 无需停止"
+else
+  for p in $PIDS; do
+    if [ "$FORCE" = 1 ]; then
+      echo "[i] --force: 杀进程树 pid $p"
+      kill_tree "$p"
+    else
+      echo "[i] 优雅停止 xfce4-session pid $p"
+      kill -TERM "$p" 2>/dev/null
+    fi
+  done
+  sleep 2
+  LEFT=$(session_on_display "$DISP")
+  if [ -n "$LEFT" ]; then
+    echo "[!] 还有残留 (pid $LEFT) —— 用 stopx11 --force"
+  else
+    echo "[OK] $DISP 的桌面会话已停止"
+  fi
+fi
+
+# picom 合成器随桌面一起收 (startx11 起的, 不收下次会残留打架)
+if pgrep -x picom >/dev/null 2>&1; then
+  echo "[i] 停 picom 合成器"
+  pkill -x picom 2>/dev/null
+fi
+
+[ -f "$PIDF" ] && rm -f "$PIDF"
+
+# 复核 VNC 没被误伤
+V=$( { tr '\0' '\n' < /proc/1/environ; } 2>/dev/null >/dev/null; \
+     for d in /proc/[0-9]*; do c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
+       case "$c" in *Xtigervnc*) echo "${d#/proc/}";; esac; done )
+if [ -n "$V" ]; then
+  echo "[i] VNC(:1) 仍在运行 (Xtigervnc pid $V) —— 未受影响 ✔"
+else
+  echo "[i] 当前没有 Xtigervnc 在跑(本来就没起, 或已被 stopvnc 停掉)"
+fi

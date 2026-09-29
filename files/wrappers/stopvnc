@@ -1,0 +1,22 @@
+#!/bin/bash
+# stopvnc —— 停止 :1 (2026-09-23 改: startvnc 现在直起 Xvnc, 不再经 vncserver,
+#   所以 `vncserver -kill :1` 对直起的实例无效, 改为按 display 精确杀进程)
+set -u
+export USER=root HOME=/root
+DISP=:1
+killed=""
+for p in /proc/[0-9]*; do
+  pid=${p#/proc/}
+  [ "$pid" = "$$" ] && continue
+  [ "$pid" = "$PPID" ] && continue
+  c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null ) || continue
+  case "$c" in
+    *Xtigervnc*\ $DISP\ *|*Xtigervnc-dri3*\ $DISP\ *) kill "$pid" 2>/dev/null && killed="$killed $pid" ;;
+  esac
+done
+sleep 2
+for pid in $killed; do [ -d /proc/$pid ] && kill -9 "$pid" 2>/dev/null; done
+# vncserver 起的实例也一并照顾(幂等, 失败无所谓)
+vncserver -kill "$DISP" >/dev/null 2>&1
+rm -f "/tmp/.X${DISP#:}-lock" "/tmp/.X11-unix/X${DISP#:}" 2>/dev/null
+if [ -n "$killed" ]; then echo "[OK] 已停止 $DISP (pid$killed)"; else echo "[i] $DISP 本来就没在跑"; fi

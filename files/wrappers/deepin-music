@@ -1,0 +1,14 @@
+#!/bin/bash
+# /usr/local/bin/deepin-music —— 深度音乐用户级包装(2026-09-25, 防 apt 更新覆盖)
+# 深度音乐的播放后端是 libvlc(运行时 dlopen libvlc.so)。libvlccore 靠读 /proc/self/maps
+# 找自己所在目录来推算数据目录; proot 不翻译 maps 内容, 拿到的是宿主路径
+# /data/data/com.termux/files/home/Ubuntu/usr/lib/..., 于是 bindtextdomain("vlc") 指向
+# 容器内不存在的目录, libvlc 自身的文本(音轨"禁用"、错误提示等)永远是英文。
+# libvlccore 优先读 VLC_DATA_PATH, 显式指回容器内路径即可(与 /usr/local/bin/vlc 同一修法)。
+# 注: /proc/self/exe 在 proot 里是被正确翻译的, 受影响的只是读 /proc/self/maps 定位自身的程序。
+export VLC_DATA_PATH="${VLC_DATA_PATH:-/usr/share/vlc}"
+# 2026-09-25 补: VLC_DATA_PATH 只治 locale, 插件目录走的是另一条(宿主)路径 ——
+# 实测 dmusic-after.log 仍有 open64 /data/.../usr/lib/aarch64-linux-gnu/vlc/plugins/plugins.dat rc=-1。
+# libvlccore 只认 VLC_DATA_PATH / VLC_PLUGIN_PATH 两个环境变量(strings 实测), 显式补上插件路径。
+export VLC_PLUGIN_PATH="${VLC_PLUGIN_PATH:-/usr/lib/aarch64-linux-gnu/vlc/plugins}"
+exec /usr/bin/deepin-music "$@"

@@ -1,0 +1,26 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# spark-store 启动包装 (2026-09-24 重建)
+#
+# ★为什么需要它: spark-store.desktop 的 Exec 是裸名 `spark-store %u`(走 PATH),
+#   而 PATH 里 /usr/local/bin 优先。此处曾经是一个【断链符号链接】
+#   (→ /opt/durapps/spark-store/bin/spark-store, 该文件在包里就是 missing 的),
+#   导致点图标/敲命令一律 127 "没有那个文件或目录" —— 这就是"星火打不开"的真因。
+#   ⚠ 别再把这里做成指向 /opt/durapps/... 的软链: 那个目录只有 aptss/apt-fast 等辅助脚本,
+#     主程序根本不在那儿。真正的主程序是 /opt/spark-store/bin/spark-store(187MB Electron)。
+#
+# ★Electron in proot 必须的两个参数:
+#   --no-sandbox            chrome-sandbox 要 setuid root, proot 假 root 位不生效,
+#                           裸跑报 "Running as root without --no-sandbox is not supported"
+#   --disable-dev-shm-usage 本环境 start.sh 把 /dev/shm 绑成了 /root
+# ══════════════════════════════════════════════════════════════════════
+set -u
+BIN=/opt/spark-store/bin/spark-store
+[ -x "$BIN" ] || { echo "[✘] 找不到星火主程序 $BIN"; exit 1; }
+export DISPLAY="${DISPLAY:-:1}"
+[ -r /root/.config/desktop-env/gpu.sh ] && . /root/.config/desktop-env/gpu.sh
+# Electron 专用 GPU 参数(见 electron-gpu.sh; 与 gpu.sh 分工: 那个管环境变量, 这个管命令行开关)
+[ -r /root/.config/desktop-env/electron-gpu.sh ] && . /root/.config/desktop-env/electron-gpu.sh
+FLAGS="${ELECTRON_GPU_FLAGS:---no-sandbox --disable-dev-shm-usage --disable-gpu-sandbox}"
+[ -n "${SPARK_SOFT:-}" ] && FLAGS="$FLAGS --disable-gpu --disable-software-rasterizer"
+exec "$BIN" $FLAGS "$@"

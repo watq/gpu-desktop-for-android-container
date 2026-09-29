@@ -1,0 +1,14 @@
+#!/bin/bash
+# apm —— 桩(2026-09-23): 让星火 qc()=`which apm` 命中 → 跳过"需要安装APM"弹窗(改静默)。
+# 背景: 真 apm 是 bubblewrap 容器管理器(依赖 bwrap/systemd/flatpak/fuse-overlayfs),
+#   proot 内(假root/无用户命名空间)容器根本起不来 → apm 类应用无法运行, 装真 apm 无意义。
+#   本桩只为消除每次下载都弹的模态框; 用户能装的是 spark(deb) 类应用(走 aptss/ssinstall)。
+# 撤销: rm /usr/local/bin/apm
+case "$1" in
+  ""|--version|-v|version) echo "apm (proot stub) 1.2.4-compat"; exit 0 ;;
+  install|ssinstall)
+    echo "APM 容器在 proot 内不受支持(需 bubblewrap/systemd/用户命名空间, 假root下不可用)。" >&2
+    echo "此应用为 APM 容器类型, 无法在本环境运行; 请选 deb/spark 类应用。" >&2
+    exit 1 ;;
+  *) exit 0 ;;
+esac

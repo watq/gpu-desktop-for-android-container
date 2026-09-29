@@ -1,0 +1,40 @@
+#!/bin/bash
+# /usr/local/bin/vlc-rebuild-cache —— 重建 VLC 用户级插件缓存(账本 N4)
+# 在 /usr/local/lib/vlc/plugins 建真插件目录的符号链接镜像, 并在镜像里生成 plugins.dat。
+# 这样就不用动 dpkg 管的 /usr/lib/aarch64-linux-gnu/vlc/plugins/plugins.dat。
+# apt 更新 vlc-plugin-* 之后跑一次即可。
+set -eu
+
+SRC=$(ls -d /usr/lib/*/vlc/plugins 2>/dev/null | head -1)
+GEN=$(ls /usr/lib/*/vlc/vlc-cache-gen 2>/dev/null | head -1)
+DST=/usr/local/lib/vlc/plugins
+LIBDIR=/usr/local/lib/vlc
+
+[ -n "$SRC" ] || { echo "找不到 VLC 插件目录" >&2; exit 1; }
+[ -n "$GEN" ] || { echo "找不到 vlc-cache-gen" >&2; exit 1; }
+echo "源插件目录: $SRC"
+echo "cache-gen : $GEN"
+
+# 补 SONAME 软链接: 系统里只有 libvlc_xxx.so.0.0.0, 缺 libvlc_xxx.so.0
+# (ldconfig 没为该目录跑过)。不补的话 pulse/xcb/vdpau 插件全加载不了。
+mkdir -p "$LIBDIR"
+for f in "$(dirname "$SRC")"/libvlc_*.so.*.*.*; do
+    [ -e "$f" ] || continue
+    soname=$(objdump -p "$f" 2>/dev/null | awk '/SONAME/{print $2}')
+    [ -n "$soname" ] || soname="$(basename "${f%.*.*}")"
+    ln -sfn "$f" "$LIBDIR/$soname"
+    echo "SONAME 链接: $LIBDIR/$soname -> $f"
+done
+
+rm -rf "$DST"
+mkdir -p "$DST"
+n=0
+for d in "$SRC"/*/; do
+    [ -d "$d" ] || continue
+    ln -sfn "$d" "$DST/$(basename "$d")"
+    n=$((n+1))
+done
+echo "已链接 $n 个插件子目录 -> $DST"
+
+LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$GEN" "$DST"
+echo "已生成: $(ls -la "$DST/plugins.dat")"

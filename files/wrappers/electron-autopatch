@@ -1,0 +1,153 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# electron-autopatch —— 自动识别所有 Electron 应用并套上 electron-wrap (2026-09-23)
+#   扫描系统 .desktop → 判定是否 Electron → 在【用户级】目录生成 override .desktop,
+#   把 Exec 改走 /usr/local/bin/electron-wrap, 自动补 --no-sandbox / --disable-dev-shm-usage。
+#   · 用户级防更新覆盖: 只写 /root/.local/share/applications 与 /usr/local/bin, 不碰 dpkg 文件。
+#   · 幂等: 可反复跑; 只覆盖自己生成的(带 X-Electron-Autopatch=1 标记), 不动用户手写的 override。
+#   · 由 ~/.config/autostart 在每次进桌面时自动跑一遍, 新装的 Electron 应用会被自动接管。
+# 用法: electron-autopatch          正常扫描并套补丁
+#       electron-autopatch --status  只列出已生成的 override, 不改动
+#       electron-autopatch --clean    删除所有本工具生成的 override
+# ══════════════════════════════════════════════════════════════════════
+set -u
+WRAP=/usr/local/bin/electron-wrap
+OUT=/root/.local/share/applications
+SYS_DIRS=(/usr/share/applications)
+MARK=X-Electron-Autopatch
+mkdir -p "$OUT"
+
+case "${1:-}" in
+  --status)
+    echo "本工具生成的 Electron override (在 $OUT):"
+    grep -lrx "$MARK=1" "$OUT"/*.desktop 2>/dev/null | while read -r f; do
+      printf "  %-45s %s\n" "$(basename "$f")" "$(grep -m1 '^Exec=' "$f" | sed 's/^Exec=//')"
+    done
+    exit 0 ;;
+  --clean)
+    n=0
+    for f in "$OUT"/*.desktop; do
+      [ -f "$f" ] || continue
+      grep -qx "$MARK=1" "$f" 2>/dev/null && { rm -f "$f"; n=$((n+1)); echo "[del] $(basename "$f")"; }
+    done
+    echo "[done] 清除 $n 个自动生成的 override"; exit 0 ;;
+esac
+
+# ── 解析 Exec= 里的真实可执行文件 (跳过 env/sudo 前缀、VAR=val、选项、field code) ──
+resolve_bin() {
+  local line tok bin
+  line=$(echo "$1" | sed -E 's/%[UufFdDnNickvm]//g')
+  for tok in $line; do
+    case "$tok" in
+      env|sudo) continue ;;
+      *=*|-*)   continue ;;
+    esac
+    if command -v "$tok" >/dev/null 2>&1; then bin=$(command -v "$tok")
+    elif [ -x "$tok" ]; then bin="$tok"
+    else return; fi
+    # ★2026-09-23: 跟随 shell 转发脚本。很多包在 /usr/bin 放一个几十字节的壳,
+    #   真身在 /opt 下(例: /usr/bin/linglong-store 只有一行 exec /opt/linglong-store/linglong_store)。
+    #   不跟进去的话, 应用根目录会被推成 /usr/bin 或 /bin, 特征文件永远找不到 → 整类应用漏网。
+    #   只跟一层, 且只认 "exec <绝对路径>" 这种明确写法, 避免误解析复杂脚本。
+    if head -c2 "$bin" 2>/dev/null | grep -q '#!'; then
+      local real
+      real=$(grep -m1 -oE '^[[:space:]]*exec[[:space:]]+"?(/[^"[:space:]]+)' "$bin" 2>/dev/null \
+             | sed -E 's/^[[:space:]]*exec[[:space:]]+"?//')
+      [ -n "$real" ] && [ -x "$real" ] && bin="$real"
+    fi
+    echo "$bin"; return
+  done
+}
+
+# ── 先排除"长得像 Electron 但其实不是"的框架 ──
+#   ★Flutter 坑(2026-09-23 实测): 玲珑商店 /opt/linglong-store 是 Flutter Linux GTK 应用,
+#     但它同样发布 data/icudtl.dat —— 而 icudtl.dat 曾在本脚本的 Electron 标记清单里,
+#     差点把 Flutter 应用判成 Electron 并塞 --no-sandbox(Flutter 根本不认这参数, 且病根不在 sandbox,
+#     它的真病根是 FLUTTER_LINUX_RENDERER 回落 software 导致 Impeller/Skia 冲突 abort, 见账本 E-Q)。
+#   → 凡是能查到 Flutter 引擎标记的, 一律不是 Electron, 直接排除。
+is_flutter() {
+  local root="$1"
+  find "$root" -maxdepth 4 \( -name libflutter_linux_gtk.so -o -name flutter_assets \) \
+       -print -quit 2>/dev/null | grep -q .
+}
+
+# ── 判定某可执行是否属于 Electron 应用 ──
+#   先按二进制路径推出"应用根目录", 再在其下 bounded find (只按文件名, 不读内容, depth 4)
+#   找 Electron 分发特征文件; 兜底再看脚本是否明显调 electron。
+is_electron() {
+  local bin="$1" root
+  [ -n "$bin" ] || return 1
+  case "$bin" in
+    /opt/apps/*/*) root=$(echo "$bin" | cut -d/ -f1-4) ;;   # /opt/apps/<id>
+    /opt/*/*)      root=$(echo "$bin" | cut -d/ -f1-3) ;;   # /opt/<pkg>
+    *)             root=$(dirname "$bin") ;;
+  esac
+  [ -d "$root" ] || root=$(dirname "$bin")
+
+  # Flutter 优先排除(它与 Electron 共用 icudtl.dat, 不排会误判)
+  is_flutter "$root" && return 1
+
+  # 强标记: 见到任意一个即可确认是 Electron(这些文件 Electron 独有)
+  if find "$root" -maxdepth 4 \( -name app.asar -o -name chrome-sandbox \
+        -o -name libffmpeg.so -o -name v8_context_snapshot.bin -o -name '*.pak' \) \
+        -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  # ★弱标记 icudtl.dat: 单独命中【不足以】判定(Flutter 也带它)。上面强标记已经覆盖了
+  #   真正的 Electron 分发, 所以这里不再单独采信 icudtl.dat —— 保留注释以免日后有人加回去。
+  if head -c2 "$bin" 2>/dev/null | grep -q '#!'; then
+    grep -qiE 'electron|app\.asar' "$bin" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+# ── 主扫描 ──
+scanned=0 patched=0 skipped=0
+for dir in "${SYS_DIRS[@]}"; do
+  for f in "$dir"/*.desktop; do
+    [ -f "$f" ] || continue
+    scanned=$((scanned+1))
+    base=$(basename "$f")
+    grep -qiE '^Type=Application' "$f" || continue
+    execline=$(grep -m1 '^Exec=' "$f" | sed 's/^Exec=//')
+    [ -n "$execline" ] || continue
+    # 已走 wrap 或已带 no-sandbox 的, 不用管
+    case "$execline" in *electron-wrap*|*--no-sandbox*) skipped=$((skipped+1)); continue ;; esac
+    bin=$(resolve_bin "$execline")
+    [ -n "$bin" ] || continue
+    # 解析到的其实是我们自己在 /usr/local/bin 里、已注入 flags 的包装脚本 → 已处理过
+    if [ "${bin#/usr/local/bin/}" != "$bin" ] && grep -qiE 'no-sandbox|electron-wrap' "$bin" 2>/dev/null; then
+      skipped=$((skipped+1)); continue
+    fi
+    is_electron "$bin" || continue
+    ovr="$OUT/$base"
+    # 已存在且不是本工具生成的(用户手写 override) → 尊重用户, 不覆盖
+    if [ -f "$ovr" ] && ! grep -qx "$MARK=1" "$ovr" 2>/dev/null; then
+      skipped=$((skipped+1)); continue
+    fi
+    # 生成 override: 保留原条目, 仅把 Exec 改走 wrap+真实bin; 去掉 TryExec 以免指向原二进制被隐藏
+    awk -v wrap="$WRAP" -v bin="$bin" '
+      function tail_args(l,   n,arr,i,idx,out){
+        n=split(l,arr," "); idx=0
+        for(i=1;i<=n;i++){ if(arr[i]!="env"&&arr[i]!="sudo"&&arr[i]!~/=/&&arr[i]!~/^-/&&arr[i]~/[^ ]/){idx=i;break} }
+        out=""; for(i=idx+1;i<=n;i++) out=(out==""?arr[i]:out" "arr[i]); return out
+      }
+      /^Exec=/{ line=$0; sub(/^Exec=/,"",line); printf "Exec=%s %s %s\n", wrap, bin, tail_args(line); next }
+      /^TryExec=/{ next }
+      { print }
+    ' "$f" > "$ovr.tmp"
+    printf '%s=1\n' "$MARK" >> "$ovr.tmp"
+    # ★幂等: 内容与现有 override 完全一致就不重写(否则每次 dpkg 安装都会刷一遍文件,
+    #   而且计数会误报成"又新套了 N 个", 让人以为补丁没生效在反复打)。
+    if [ -f "$ovr" ] && cmp -s "$ovr" "$ovr.tmp"; then
+      rm -f "$ovr.tmp"
+      skipped=$((skipped+1))
+      continue
+    fi
+    mv "$ovr.tmp" "$ovr"
+    patched=$((patched+1))
+    echo "[patch] $base  ->  electron-wrap $bin"
+  done
+done
+echo "[done] 扫描 $scanned 个 .desktop; 新套补丁 $patched 个; 跳过(非Electron/已处理) $skipped 个"
+

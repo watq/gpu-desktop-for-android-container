@@ -1,0 +1,18 @@
+# ── 绝对不能进仓库 ──
+*-key
+*key*.txt
+!*/README-放key在这里.txt
+.config/gpt_claude_ai/
+*.pem
+*.token
+# ── 大文件 / 可重新下载 ──
+*.bin
+*.deb
+*.tar.gz
+*.tar.xz
+mesa-aac/
+__pycache__/
+# ── 日志与会话(含敏感内容) ──
+*.log
+*.jsonl
+ububtu.log

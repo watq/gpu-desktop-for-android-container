@@ -1,0 +1,36 @@
+#!/bin/bash
+# ════════════════════════════════════════════════════════════════
+# pkexec 包装 —— proot 内 polkit/setuid 失效的绕过 (2026-09-22)
+#
+# 根因: proot 是【假 root】, setuid 位不生效, polkit 的 dbus-daemon-launch-helper
+#   报 "The permission of the setuid helper is not correct" / pkexec 直接 127。
+#   星火应用商店 GUI 用 `pkexec ssinstall ...` 装 deb → pkexec 失败 → 下载到 99%
+#   却装不上, 卡住。其它用 polkit 提权的深度应用同理。
+# 做法: 容器内本来就是 root, pkexec 的提权语义无意义 → 剥掉 pkexec 的选项,
+#   直接以当前身份 exec 目标命令。放 /usr/local/bin(PATH 在 /usr/bin 前)覆盖真 pkexec,
+#   不动系统原 /usr/bin/pkexec(可随时回退)。
+#
+# 支持的 pkexec 用法:
+#   pkexec [--user NAME] [--disable-internal-agent] PROGRAM [ARGS...]
+#   pkexec --version | --help
+# ════════════════════════════════════════════════════════════════
+case "${1:-}" in
+  --version) echo "pkexec version 0.105 (proot-shim)"; exit 0 ;;
+  --help)    echo "Usage: pkexec [--user NAME] PROGRAM [ARGUMENTS...]  (proot shim: 直接以 root 运行)"; exit 0 ;;
+esac
+
+# 剥掉 pkexec 自己的选项, 只留下要执行的命令
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user) shift 2 ;;                    # --user NAME: 忽略(我们就是 root)
+    --disable-internal-agent) shift ;;    # 忽略
+    --) shift; break ;;
+    -*) shift ;;                          # 其它未知选项一律吃掉
+    *) break ;;                           # 第一个非选项 = 要执行的程序
+  esac
+done
+
+[ $# -gt 0 ] || { echo "pkexec(shim): 没有要执行的命令" >&2; exit 127; }
+
+# pkexec 正常会把环境清成最小集; 但星火/深度应用依赖当前环境, 这里直接透传更实用
+exec "$@"

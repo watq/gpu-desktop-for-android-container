@@ -1,0 +1,13 @@
+#!/bin/bash
+# lx-music-desktop 启动器(2026-09-23) —— Electron 应用在 proot 假 root 下必须 --no-sandbox。
+#   裸跑报 "Running as root without --no-sandbox is not supported"(chrome-sandbox 需 setuid root,
+#   proot 假 root 位不生效)。同 spark-store 一套路。--disable-dev-shm-usage: /dev/shm 被绑成 /root。
+#   GPU 跟随全局 kgsl 路线(desktop-env/gpu.sh); 花屏/崩溃可临时 export LIBGL_ALWAYS_SOFTWARE=1。
+set -u
+BIN=/opt/lx-music-desktop/lx-music-desktop
+[ -x "$BIN" ] || { echo "[✘] 找不到 $BIN(lx-music 没装好?)"; exit 1; }
+export DISPLAY="${DISPLAY:-:1}"
+[ -r /root/.config/desktop-env/gpu.sh ] && . /root/.config/desktop-env/gpu.sh
+# Electron 专用 GPU 参数(见 electron-gpu.sh; 与 gpu.sh 分工: 那个管环境变量, 这个管命令行开关)
+[ -r /root/.config/desktop-env/electron-gpu.sh ] && . /root/.config/desktop-env/electron-gpu.sh
+exec "$BIN" ${ELECTRON_GPU_FLAGS:---no-sandbox --disable-dev-shm-usage} "$@"

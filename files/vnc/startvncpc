@@ -1,0 +1,4 @@
+export USER=root
+export HOME=/root       
+LD_PRELOAD=/lib/aarch64-linux-gnu/libgcc_s.so.1
+vncserver -geometry 2400x1080 -depth 24 -name remote-desktop -localhost no -dpi 90 :1

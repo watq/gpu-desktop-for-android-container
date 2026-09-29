@@ -1,0 +1,40 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# electron-wrap —— 通用 Electron 启动包装 (2026-09-23, 用户级)
+#   proot 假 root 下 Electron 必须 --no-sandbox: chrome-sandbox 需要 setuid root,
+#     而 proot 是假 root 位不生效, 裸跑报
+#     "Running as root without --no-sandbox is not supported"。
+#   --disable-dev-shm-usage: 本环境 start.sh 把 /dev/shm 绑成了 /root, Chromium
+#     用 /dev/shm 共享内存会崩, 关掉改用临时文件。
+#   GPU 跟随全局 kgsl 路线 (desktop-env/gpu.sh); 花屏可临时 export LIBGL_ALWAYS_SOFTWARE=1。
+# 用法: electron-wrap <真实可执行> [原参数...]
+#   由 electron-autopatch 生成的用户级 .desktop 调用; 也可手动包装任意 Electron 程序。
+# ══════════════════════════════════════════════════════════════════════
+set -u
+export DISPLAY="${DISPLAY:-:1}"
+# ★2026-09-24: BIN 必须在 source electron-gpu.sh 【之前】取到 —— 那个脚本要按二进制的
+#   Chrome 版本自动选档(≤144 走真硬件 kgsl 档, ≥148 走软件 swsafe 档, 见 已验证事实 E-BF/E-BH)。
+#   原来是先 source 再 BIN="$1", 探测不到版本只能回落保守档。
+[ $# -ge 1 ] || { echo "electron-wrap: 缺少可执行文件参数" >&2; exit 2; }
+BIN="$1"; shift
+export ELECTRON_BIN="$BIN"
+
+[ -r /root/.config/desktop-env/gpu.sh ] && . /root/.config/desktop-env/gpu.sh
+
+# ★Electron 专用 GPU 环境(与 Firefox/VLC 的 gpu.sh 分开, 见该文件头部说明)
+#   它导出 ELECTRON_GPU_FLAGS, 已含 --no-sandbox / --disable-dev-shm-usage,
+#   所以下面的幂等注入只在它不可用时才兜底。
+[ -r /root/.config/desktop-env/electron-gpu.sh ] && . /root/.config/desktop-env/electron-gpu.sh
+
+
+# 幂等注入: 传进来的参数里已含则不重复加 (内层脚本可能自带 --no-sandbox, 重复也无害)
+inject=()
+case " $* " in *" --no-sandbox "*) : ;;            *) inject+=(--no-sandbox) ;; esac
+case " $* " in *" --disable-dev-shm-usage "*) : ;; *) inject+=(--disable-dev-shm-usage) ;; esac
+
+# 有 electron-gpu.sh 就用它那套(更完整); 否则退回最小注入
+if [ -n "${ELECTRON_GPU_FLAGS:-}" ]; then
+  exec "$BIN" $ELECTRON_GPU_FLAGS "$@"
+else
+  exec "$BIN" "${inject[@]}" "$@"
+fi

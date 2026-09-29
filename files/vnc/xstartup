@@ -1,0 +1,21 @@
+#!/bin/bash
+xrdb ${HOME}/.Xresources
+export PULSE_SERVER=127.0.0.1
+# 电池链路(原生 power-manager-plugin 用): fakebat同步 → 系统D-Bus → upowerd
+# proot 无 systemd/udev 需手动拉; 幂等, :2 那边先起过也不会重复。
+[ -x /root/.local/bin/power-stack.sh ] && /root/.local/bin/power-stack.sh start >/tmp/power-stack-vnc.log 2>&1
+# ── 应用运行时环境(2026-09-25 补) ────────────────────────────────
+# 原先只有 /usr/local/bin/startx11:90 source 了 apps.sh, 走 VNC(:1) 起的桌面
+# 拿不到 LANG/LANGUAGE、QT_QPA_PLATFORM、XDG_RUNTIME_DIR、VLC_PLUGIN_PATH 等,
+# 导致 :1 上的 Qt/libvlc 应用行为与 :2(Termux:X11) 不一致。
+# 与 startx11 同顺序: apps.sh 必须在 im.sh 和起桌面【之前】。
+[ -r /root/.config/desktop-env/apps.sh ] && . /root/.config/desktop-env/apps.sh
+# 中文输入法(ibus+libpinyin)
+if [ -r /root/.config/desktop-env/im.sh ]; then . /root/.config/desktop-env/im.sh; im_start; fi
+
+# 光标同步(2026-09-25, 同 startx11): 桌面起来后把 xfconf 里的光标主题/大小推给 xrdb + 根窗。
+# 必须【后台延时】: 下面是 exec, 之后的代码不会执行; 且要等 xfsettingsd 起来才读得到 xfconf。
+[ -x /root/.config/desktop-env/cursor-sync.sh ] && \
+  ( sleep 8; /root/.config/desktop-env/cursor-sync.sh "${DISPLAY:-:1}" ) >/dev/null 2>&1 &
+
+exec dbus-launch --exit-with-session startxfce4

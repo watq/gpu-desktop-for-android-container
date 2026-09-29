@@ -1,0 +1,129 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════════
+# /root/.local/lib/spark-shim/aptss —— aptss 用户级包装 (2026-09-24)
+#
+# 入口: /usr/bin/aptss 与 /usr/local/bin/aptss 均为软链 → 本文件(非包管理, dpkg -S 查无; /bin 即 /usr/bin)。
+#   星火 GUI 卸载链: spark-store(Electron) → /opt/spark-store/extras/shell-caller.sh 的 aptss 分支
+#     → `/usr/bin/aptss remove <包...> -y`(硬编码绝对路径, 不走 PATH)。
+# 为什么本体放这里、入口做软链(防更新覆盖):
+#   spark-store 包的 postinst(configure, 每次安装/升级/重配置)无条件 `ln -s -f 真身 /usr/bin/aptss`
+#   (prerm 还会 `unlink /usr/bin/aptss`), 所以【入口路径上的东西必然被冲掉】, 本体不能住在那儿。
+#   本体住 /root/.local/lib/spark-shim/, 升级最多丢入口软链, 由同目录 relink.sh 自愈 ——
+#   本脚本开头调一次, 会改包的命令跑完再调一次(星火升级自己时 postinst 刚把入口改回真身, 收尾就改回来)。
+#   ★为什么不放 /usr/local/lib: 那里是【系统级】路径, 账本 E-AH 的"用户级"判据要求落点在 $HOME 下;
+#     本机桌面用户就是 root, 故 /root/.local/lib —— 与 fake-upowerd(/root/.local/bin)同一套落点习惯。
+#     两者都不归任何包管理器管(dpkg -S 查无), apt 冲不掉; 区别只是"用户级 vs 系统级"这一条。
+#   ※ 入口软链 /usr/bin/aptss、/usr/local/bin/aptss 本身归 spark-store 的 postinst 创建,
+#     原指向已备份: /root/工具箱/backup/aptss.usr_bin.symlink.20260924_161957(+ .txt 说明), usr_local_bin 同名式样。
+#   ★真身 /opt/durapps/spark-store/bin/aptss 归 spark-store 包, 一个字都没动(dpkg -V spark-store 可核)。
+#
+# 干什么:
+#   · 只读/无关命令(policy/search/update/ssupdate/...): 直接 exec 真身, 与直接调真身完全等价。
+#   · 安装类(install|reinstall|upgrade|full-upgrade|dist-upgrade): 跑真身 → 记 rc → relink → exit rc。
+#   · 卸载类(remove|purge|autoremove|autopurge): 跑真身 → 记 rc → relink → 刷新应用菜单
+#     → 列出孤儿桌面项(默认不删) → exit rc。
+#     刷新 = update-desktop-database(系统 + 用户级 applications 目录)
+#          + 扫 /proc 找【每个正在运行的 xfce4-panel】, 用它自己 /proc/<pid>/environ 里的
+#            DISPLAY / XAUTHORITY / DBUS_SESSION_BUS_ADDRESS 跑一次 `timeout 5 xfce4-panel -r`。
+#       不依赖调用者自己的 DISPLAY(GUI 链若经 pkexec 会被洗掉); :1(VNC) 与 :2(Termux:X11)
+#       各有面板时按 DISPLAY 去重、各刷各的。
+#     ★孤儿桌面项(账本 E-AL 实锤): 卸载后菜单里还留着条目, 光刷面板没用 —— 因为残留的是
+#       electron-autopatch 生成在 ~/.local/share/applications 的用户级 override(系统级同名已被 dpkg 删掉)。
+#       清理逻辑在 clean-orphan-desktops.sh; 本脚本只以【--list(只打印)】调它,
+#       真删要么手动 `clean-orphan-desktops.sh --delete`, 要么显式 APTSS_ORPHAN_CLEAN=1(默认关)。
+#       —— 删文件必须先问用户, 这是刻意的默认值, 别顺手改成 1。
+#   子命令按 $1 判断, 与真身自己的分支判断方式一致(shell-caller 传的是 `remove <包...> -y`)。
+# ★退出码必须原样透传: 星火 GUI 靠它判断卸载成功与否。刷新/自愈/孤儿检查失败一律吞掉, 绝不影响退出码。
+#
+# 测试开关(仅测试用): APTSS_REFRESH_DRYRUN=1 → 刷新步骤只打印"将对哪些 DISPLAY 执行什么", 不真执行。
+#   真身照常执行, 所以测试务必用不存在的包名 + -s(模拟), 例:
+#     APTSS_REFRESH_DRYRUN=1 aptss remove -s zz-no-such-pkg
+# 回退: 先删 /root/.local/lib/spark-shim/relink.sh(否则会被自愈改回来), 再
+#       ln -sfn /opt/durapps/spark-store/bin/aptss /usr/bin/aptss   (/usr/local/bin/aptss 同理)
+# ══════════════════════════════════════════════════════════════════════
+SHIM=/root/.local/lib/spark-shim
+REAL=/opt/durapps/spark-store/bin/aptss
+
+[ -x "$SHIM/relink.sh" ] && "$SHIM/relink.sh"
+[ -x "$REAL" ] || { echo "[✘] 找不到真正的 aptss: $REAL" >&2; exit 127; }
+
+case "${1:-}" in
+  remove|purge|autoremove|autopurge)                    mode=remove ;;
+  install|reinstall|upgrade|full-upgrade|dist-upgrade)  mode=install ;;
+  *)                                                     exec "$REAL" "$@" ;;
+esac
+
+# 取 /proc/<pid>/environ 里某个变量的值(NUL 分隔); 没有则返回 1
+_env_of() {
+  local kv
+  while IFS= read -r -d '' kv; do
+    case "$kv" in "$2="*) printf '%s' "${kv#*=}"; return 0 ;; esac
+  done 2>/dev/null < "$1/environ"
+  return 1
+}
+
+refresh_menus() {
+  local dry="${APTSS_REFRESH_DRYRUN:-0}"
+  local -a dirs=(/usr/share/applications) argv envcmd
+  local ud="${HOME:-/root}/.local/share/applications"
+  local p a d x b shown seen=" " n=0
+  [ -d "$ud" ] && dirs+=("$ud")
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    if [ "$dry" = 1 ]; then
+      echo "[aptss-refresh][dry-run] 将执行: update-desktop-database ${dirs[*]}" >&2
+    else
+      update-desktop-database "${dirs[@]}" >/dev/null 2>&1
+    fi
+  fi
+
+  command -v xfce4-panel >/dev/null 2>&1 || return 0
+  for p in /proc/[0-9]*; do
+    argv=()
+    mapfile -d '' -t argv 2>/dev/null < "$p/cmdline" || continue
+    [ "${#argv[@]}" -gt 0 ] && [ "${argv[0]##*/}" = xfce4-panel ] || continue
+    # 只认常驻面板; 跳过别人正在执行的一次性客户端调用(xfce4-panel -r / -q)
+    for a in "${argv[@]:1}"; do
+      case "$a" in -r|--restart|-q|--quit) continue 2 ;; esac
+    done
+    d=$(_env_of "$p" DISPLAY) || continue
+    [ -n "$d" ] || continue
+    case "$seen" in *" $d "*) continue ;; esac
+    seen+="$d "
+    x=$(_env_of "$p" XAUTHORITY)
+    b=$(_env_of "$p" DBUS_SESSION_BUS_ADDRESS)
+    envcmd=(env -u XAUTHORITY -u DBUS_SESSION_BUS_ADDRESS "DISPLAY=$d")
+    [ -n "$x" ] && envcmd+=("XAUTHORITY=$x")
+    [ -n "$b" ] && envcmd+=("DBUS_SESSION_BUS_ADDRESS=$b")
+    n=$((n+1))
+    if [ "$dry" = 1 ]; then
+      shown="${b%%,*}"
+      echo "[aptss-refresh][dry-run] 面板 pid=${p#/proc/}: DISPLAY=$d XAUTHORITY=${x:-<未设>} DBUS=${shown:-<未设>} → 将执行: timeout 5 xfce4-panel -r" >&2
+    else
+      "${envcmd[@]}" timeout 5 xfce4-panel -r >/dev/null 2>&1 </dev/null || true
+    fi
+  done
+  if [ "$dry" = 1 ] && [ "$n" -eq 0 ]; then
+    echo "[aptss-refresh][dry-run] 没找到带 DISPLAY 的常驻 xfce4-panel, 跳过面板刷新" >&2
+  fi
+  return 0
+}
+
+"$REAL" "$@"
+rc=$?
+
+# 这次可能升级/卸载了 spark-store 自己(postinst 改回入口 / prerm 删入口): 自愈(真身没了就不动)
+[ -x "$SHIM/relink.sh" ] && "$SHIM/relink.sh"
+
+[ "$mode" = remove ] && refresh_menus
+
+# 孤儿桌面项: ★默认只列不删(删文件要用户点头); APTSS_ORPHAN_CLEAN=1 才真删
+if [ "$mode" = remove ] && [ -x "$SHIM/clean-orphan-desktops.sh" ]; then
+  if [ "${APTSS_ORPHAN_CLEAN:-0}" = 1 ]; then
+    "$SHIM/clean-orphan-desktops.sh" --delete >&2 || true
+  else
+    "$SHIM/clean-orphan-desktops.sh" --list >&2 || true
+  fi
+fi
+
+exit "$rc"

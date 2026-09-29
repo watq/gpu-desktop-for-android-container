@@ -1,0 +1,19 @@
+#!/bin/bash
+# ════════════════════════════════════════════════════════════════
+# picom-autostart —— xfce 自启中的 picom 守卫 (2026-09-22)
+#
+# 背景: /etc/xdg/autostart/picom.desktop 会在【每个】xfce 会话自启 picom。
+#   但我们只想在 Termux:X11(:2) 用 picom 合成(吃 GPU 补帧);
+#   VNC(:1) 用 TigerVNC 自己, 多一个 picom 反而【隐藏面板】(实测 21:30 截图: 顶栏消失)。
+#   而且 :2 上 startx11 也会起 picom → 两个抢 :2 打架崩(X error 8 MATCH)。
+#   本守卫把 picom 收敛成: 只在 :2、且全局单实例。
+# ════════════════════════════════════════════════════════════════
+# 只在 Termux:X11(:2) 起合成器; 其它 display(尤其 VNC :1) 一律不起
+case "${DISPLAY%.*}" in
+  :2) ;;
+  *) exit 0 ;;
+esac
+# 单实例: 先清掉本机所有 picom(不管在哪个 display), 再起一个干净的
+pkill -x picom 2>/dev/null
+sleep 1
+exec picom --config /root/.config/picom.conf

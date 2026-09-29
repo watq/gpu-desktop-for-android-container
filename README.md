@@ -76,22 +76,6 @@
 ```bash
 MESA_LOADER_DRIVER_OVERRIDE=kgsl     # OpenGL 走 Adreno 原生, 不经 zink
 ```
-README.md                                  全部实测结论(本仓主体)
-files/desktop-env/
-  gpu.sh                                   GPU 环境变量(kgsl / Turnip / WSI)
-  electron-gpu.sh                          Electron 按 Chromium 版本自动分档
-  cursor-sync.sh                           xfconf → xrdb → 根窗光标 同步
-  cursor-watch.sh                          常驻看守: xfconf 变更时自动重新同步
-  present-policy.sh                        按 display 选呈现路径(避开缺围栏那条)
-files/local-lib/electron-shim/
-  fakepci.c                                LD_PRELOAD 伪造 PCI 枚举(核心)
-tools/
-  make-hidpi-cursor.py                     生成多档尺寸光标主题(纯标准库)
-  measure-lib.sh                           测量纪律函数库(归一化/验证器/交错/自检)
-  present-run.sh                            按策略拉起播放器
-files/icons/
-  README-光标主题重建.txt                    光标主题重建说明(含回落链根那条)
-```
 
 ### VNC 侧 Vulkan swapchain
 

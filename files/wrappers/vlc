@@ -1,0 +1,80 @@
+#!/bin/bash
+# /usr/local/bin/vlc —— VLC 用户级包装(账本 N4)
+# 目的: 在 proot 假 root(uid=0 但非真特权)环境下让 VLC 正常启动。
+#
+# 做了三件事, 全部用户级、可逆、不改 dpkg 文件:
+#   1) LD_PRELOAD=/usr/local/lib/noroot-shim.so  劫持 geteuid/getuid 返回 1000,
+#      绕过 VLC 的 "VLC is not supposed to be run as root. Sorry." 检查。
+#      (注: 当前 /usr/bin/vlc 恰好还残留着历史上的 geteuid->getppid 二进制补丁,
+#       但一旦 apt 更新 vlc-bin 补丁就没了 —— 有这个 shim 就不怕。)
+#   2) VLC_PLUGIN_PATH 指向 /usr/local/lib/vlc/plugins —— 那是真插件目录的符号链接镜像,
+#      里面有我们自己生成的 plugins.dat, 消除 "stale plugins cache" 刷屏。
+#      重建方法: /usr/local/bin/vlc-rebuild-cache
+#   3) LD_LIBRARY_PATH=/usr/local/lib/vlc —— 补上系统里缺失的 SONAME 软链接
+#      (系统只有 libvlc_pulse.so.0.0.0 却没有 libvlc_pulse.so.0, ldconfig 没跑过),
+#      否则 pulse 音频输出 / xcb_x11+xcb_xv 视频输出 / 全部 vdpau 插件都加载不了。
+#      DT_RUNPATH 是绝对路径, 但 LD_LIBRARY_PATH 优先级高于 RUNPATH, 所以这招有效。
+#   4) 注入本机已验证可用的 GPU 变量(Adreno 830 / KGSL 原生 GL)与 PULSE_SERVER。
+#
+# 环境开关:
+#   VLC_SW=1   强制软件渲染(GPU 出问题时用)
+#   VLC_NO_PRELOAD=1  不加载 noroot shim(调试用)
+set -u
+
+REAL_VLC=/usr/bin/vlc
+SHIM=/usr/local/lib/noroot-shim.so
+PLUGIN_MIRROR=/usr/local/lib/vlc/plugins
+
+[ -x "$REAL_VLC" ] || { echo "vlc-wrapper: 找不到 $REAL_VLC" >&2; exit 127; }
+
+# --- 1. noroot shim ---
+if [ "${VLC_NO_PRELOAD:-0}" != 1 ] && [ -f "$SHIM" ]; then
+    if [ -n "${LD_PRELOAD:-}" ]; then
+        export LD_PRELOAD="$SHIM:$LD_PRELOAD"
+    else
+        export LD_PRELOAD="$SHIM"
+    fi
+fi
+
+# --- 2. 缺失的 SONAME 软链接(pulse / xcb_events / vdpau) ---
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    export LD_LIBRARY_PATH="/usr/local/lib/vlc:$LD_LIBRARY_PATH"
+else
+    export LD_LIBRARY_PATH="/usr/local/lib/vlc"
+fi
+
+# --- 3. 插件缓存(用户级镜像) ---
+if [ -f "$PLUGIN_MIRROR/plugins.dat" ]; then
+    export VLC_PLUGIN_PATH="$PLUGIN_MIRROR"
+fi
+
+# --- 3b. 汉化(2026-09-24, 已验证事实 E-BM) ---
+# VLC 用 /proc/self/exe 推算自身位置来定位数据目录, 翻译目录 = 数据目录/../locale。
+# proot 里 /proc/self/exe 解析成【宿主路径】/data/data/com.termux/files/home/Ubuntu/usr/bin/vlc,
+# 于是 bindtextdomain("vlc") 指向容器内不存在的目录 → vlc.mo 永远加载不到, 界面全英文。
+# libvlccore 优先读 VLC_DATA_PATH, 显式指回容器内路径即可(用户级, 不改任何 dpkg 文件)。
+export VLC_DATA_PATH="${VLC_DATA_PATH:-/usr/share/vlc}"
+
+# --- 4. 音频 ---
+export PULSE_SERVER="${PULSE_SERVER:-127.0.0.1}"
+
+# 注: 日志里 "QStandardPaths: runtime directory ... is not owned by UID 1000" 是无害的。
+# 成因: shim 让 Qt 的 geteuid() 返回 1000, 而 XDG_RUNTIME_DIR 实际属主是 root;
+# proot 的假 root 下 chown 不生效, 改不掉, Qt 会自行回落, 不影响功能。
+
+# --- 5. GPU ---
+if [ "${VLC_SW:-0}" = 1 ]; then
+    export LIBGL_ALWAYS_SOFTWARE=1
+    unset MESA_LOADER_DRIVER_OVERRIDE
+else
+    # 本机实测: kgsl 原生出 "Adreno (TM) 830v1"; 默认的 zink 在 :1 上
+    # CreateSwapchainKHR 会 VK_ERROR_INITIALIZATION_FAILED。故显式走 kgsl。
+    export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-kgsl}"
+    export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json}"
+    export EGL_PLATFORM="${EGL_PLATFORM:-x11}"
+    export TU_DEBUG="${TU_DEBUG:-noconform}"
+    export MESA_VK_WSI_PRESENT_MODE="${MESA_VK_WSI_PRESENT_MODE:-mailbox}"
+    export vblank_mode="${vblank_mode:-3}"
+fi
+
+exec "$REAL_VLC" "$@"

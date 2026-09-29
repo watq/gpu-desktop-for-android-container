@@ -1,0 +1,1093 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ll-cli (linyaps-lite) —— 用户级替身实现, 放在 /usr/local/bin/ 防 apt 更新覆盖。
+
+背景
+────
+本机是 Android(未 root) 上的 proot Ubuntu。官方 linglong-bin 的 ll-cli 依赖
+bwrap + 用户命名空间, proot 下必然失败(Can't read /proc/sys/kernel/overflowuid)。
+所以这里用纯 Python 重写一份 "无容器" 的 ll-cli:
+
+  * 仓库: 直接用 ostree 从官方 https://mirror-repo-linglong.deepin.com/repos/stable 拉取
+  * 安装: ostree checkout --user-mode 到 ~/.local/share/linglong-lite/layers/
+  * 运行: 不用 bwrap, 改成 "借 base 层的 ld.so + --library-path" 直接起进程
+  * 桌面: 安装时自动在 ~/.local/share/applications/ 生成用户级 .desktop,
+          名字统一加 "(玲珑)" 后缀(如 "深度影院(玲珑)"), 与 apt 版区分开
+
+对上层(玲珑商店 Flutter 应用)提供 ll-cli 1.x 兼容的 CLI 与 JSON 输出。
+
+目录布局
+────────
+  ~/.local/share/linglong-lite/
+      ostree/                     ostree archive 仓库(bare-user 在 proot 下不可用, 缺 user xattr)
+      layers/<id>/<ver>/<arch>/<module>/   已安装的层
+      installed.json              安装索引
+      refs.cache                  远端 refs 缓存
+      ll-cli.log                  所有调用日志(排查用)
+"""
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "1.12.1"
+ARCH = "arm64"
+CHANNEL = "main"
+DEFAULT_REPO_NAME = "stable"
+DEFAULT_REPO_URL = "https://mirror-repo-linglong.deepin.com"
+REPO_PATH = "/repos/stable"
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, ".local/share/linglong-lite")
+OSTREE_REPO = os.path.join(ROOT, "ostree")
+LAYERS = os.path.join(ROOT, "layers")
+INDEX = os.path.join(ROOT, "installed.json")
+REFS_CACHE = os.path.join(ROOT, "refs.cache")
+LOGFILE = os.path.join(ROOT, "ll-cli.log")
+
+APPS_DIR = os.path.join(HOME, ".local/share/applications")
+ICONS_DIR = os.path.join(HOME, ".local/share/icons")
+
+DESKTOP_PREFIX = "linyaps-"
+NAME_SUFFIX = "(玲珑)"
+MARK_KEY = "X-Linyaps-Lite"
+
+# 运行时垫片(不存在就跳过, 不影响启动): 源码在 /root/工具箱/build-dbus-login1-stub/
+LOGIN1_SHIM = "/root/.local/lib/linglong-shim/dbus-login1-stub.so"
+
+REFS_TTL = 6 * 3600
+
+
+# ───────────────────────── 基础工具 ─────────────────────────
+
+def log(msg):
+    try:
+        os.makedirs(ROOT, exist_ok=True)
+        with open(LOGFILE, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def err(msg):
+    sys.stderr.write("ll-cli: %s\n" % msg)
+
+
+def run(cmd, **kw):
+    kw.setdefault("stdout", subprocess.PIPE)
+    kw.setdefault("stderr", subprocess.STDOUT)
+    p = subprocess.run(cmd, **kw)
+    out = p.stdout.decode("utf-8", "replace") if p.stdout else ""
+    return p.returncode, out
+
+
+def ensure_repo():
+    os.makedirs(ROOT, exist_ok=True)
+    os.makedirs(LAYERS, exist_ok=True)
+    if not os.path.exists(os.path.join(OSTREE_REPO, "config")):
+        os.makedirs(OSTREE_REPO, exist_ok=True)
+        run(["ostree", "--repo=" + OSTREE_REPO, "init", "--mode=archive"])
+    rc, out = run(["ostree", "--repo=" + OSTREE_REPO, "remote", "list"])
+    if DEFAULT_REPO_NAME not in out.split():
+        run(["ostree", "--repo=" + OSTREE_REPO, "remote", "add", "--no-gpg-verify",
+             DEFAULT_REPO_NAME, DEFAULT_REPO_URL + REPO_PATH])
+
+
+def load_index():
+    try:
+        with open(INDEX, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_index(idx):
+    os.makedirs(ROOT, exist_ok=True)
+    tmp = INDEX + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(idx, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, INDEX)
+
+
+def layer_dir(pkg_id, version, arch=ARCH, module="binary"):
+    return os.path.join(LAYERS, pkg_id, version, arch, module)
+
+
+def read_info(path):
+    try:
+        with open(os.path.join(path, "info.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ───────────────────────── 远端 refs ─────────────────────────
+
+def remote_refs(force=False):
+    ensure_repo()
+    if not force and os.path.exists(REFS_CACHE):
+        if time.time() - os.path.getmtime(REFS_CACHE) < REFS_TTL:
+            with open(REFS_CACHE, encoding="utf-8") as f:
+                return [l.strip() for l in f if l.strip()]
+    rc, out = run(["ostree", "--repo=" + OSTREE_REPO, "remote", "refs", DEFAULT_REPO_NAME],
+                  timeout=300)
+    if rc != 0:
+        if os.path.exists(REFS_CACHE):
+            with open(REFS_CACHE, encoding="utf-8") as f:
+                return [l.strip() for l in f if l.strip()]
+        err("无法获取远端 refs: %s" % out.strip()[:400])
+        return []
+    refs = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 形如 stable:main/org.deepin.movie/6.5.53.1/arm64/binary
+        refs.append(line.split(":", 1)[1] if ":" in line else line)
+    with open(REFS_CACHE, "w", encoding="utf-8") as f:
+        f.write("\n".join(refs))
+    return refs
+
+
+def vkey(v):
+    return [int(x) if x.isdigit() else 0 for x in re.split(r"[.\-+]", v)]
+
+
+def resolve_ref(pkg_id, version=None, arch=ARCH, module="binary", refs=None):
+    """在远端 refs 里找到最合适的 <channel>/<id>/<version>/<arch>/<module>。
+    version 可以是前缀(玲珑惯例: base "25.2.2" 匹配 "25.2.2.8")。"""
+    if refs is None:
+        refs = remote_refs()
+    pat = re.compile(r"^%s/%s/([0-9][0-9A-Za-z.\-+]*)/%s/%s$"
+                     % (re.escape(CHANNEL), re.escape(pkg_id), re.escape(arch), re.escape(module)))
+    cands = []
+    for r in refs:
+        m = pat.match(r)
+        if not m:
+            continue
+        v = m.group(1)
+        if version and not (v == version or v.startswith(version + ".")):
+            continue
+        cands.append((vkey(v), v, r))
+    if not cands:
+        return None, None
+    cands.sort()
+    return cands[-1][2], cands[-1][1]
+
+
+def parse_dep(dep):
+    """'main:org.deepin.base/25.2.2/arm64' -> (id, version, arch)"""
+    s = dep.split(":", 1)[1] if ":" in dep else dep
+    parts = s.split("/")
+    pid = parts[0]
+    ver = parts[1] if len(parts) > 1 else None
+    arch = parts[2] if len(parts) > 2 else ARCH
+    return pid, ver, arch
+
+
+# ───────────────────────── 安装 / 卸载 ─────────────────────────
+
+def pull_and_checkout(ref, pkg_id, version, arch, module, quiet=False):
+    ensure_repo()
+    dest = layer_dir(pkg_id, version, arch, module)
+    if os.path.exists(os.path.join(dest, "info.json")):
+        return dest
+    if not quiet:
+        print("正在下载 %s ..." % ref, flush=True)
+    rc, out = run(["ostree", "--repo=" + OSTREE_REPO, "pull", "--depth=0", "--mirror",
+                   DEFAULT_REPO_NAME, ref], timeout=7200)
+    if rc != 0:
+        err("下载失败 %s:\n%s" % (ref, out.strip()[-800:]))
+        return None
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.exists(dest):
+        shutil.rmtree(dest, ignore_errors=True)
+    if not quiet:
+        print("正在解包 %s ..." % ref, flush=True)
+    # ★--force-copy 必须加: proot 下 ostree checkout 做不了硬链接, 会退化成 .l2s.* 符号链接
+    #   指向 uncompressed-objects-cache/。后果: Qt 的 QDirListing(QDir::Files) 枚举这种目录
+    #   返回 0 条 → 报 "Could not find the Qt platform plugin xcb"(插件路径其实是对的),
+    #   /proc/self/exe 也会解析到 cache 路径。加了它签出的是真实文件。
+    rc, out = run(["ostree", "--repo=" + OSTREE_REPO, "checkout", "--user-mode",
+                   "--force-copy", ref, dest], timeout=7200)
+    if rc != 0:
+        err("解包失败 %s:\n%s" % (ref, out.strip()[-800:]))
+        return None
+    return dest
+
+
+def ensure_dep(dep, quiet=False):
+    """确保 base/runtime 依赖层已安装, 返回层目录。"""
+    pid, ver, arch = parse_dep(dep)
+    idx = load_index()
+    for key, rec in idx.items():
+        if rec.get("id") == pid and (not ver or rec["version"] == ver
+                                     or rec["version"].startswith(ver + ".")):
+            if os.path.isdir(rec["path"]):
+                return rec["path"]
+    ref, real_ver = resolve_ref(pid, ver, arch)
+    if not ref:
+        err("找不到依赖 %s (arch=%s)" % (dep, arch))
+        return None
+    path = pull_and_checkout(ref, pid, real_ver, arch, "binary", quiet=quiet)
+    if not path:
+        return None
+    info = read_info(path) or {}
+    idx = load_index()
+    idx["%s/%s/%s/binary" % (pid, real_ver, arch)] = {
+        "id": pid, "version": real_ver, "arch": arch, "module": "binary",
+        "path": path, "kind": info.get("kind", "runtime"),
+        "name": info.get("name", pid), "installed_at": int(time.time()),
+    }
+    save_index(idx)
+    return path
+
+
+def cmd_install(args):
+    target = None
+    for a in args:
+        if not a.startswith("-"):
+            target = a
+            break
+    if not target:
+        err("用法: ll-cli install <应用ID>[/版本]")
+        return 1
+    if "/" in target:
+        pkg_id, ver = target.split("/", 1)
+    else:
+        pkg_id, ver = target, None
+
+    refs = remote_refs()
+    ref, real_ver = resolve_ref(pkg_id, ver, ARCH, "binary", refs)
+    if not ref:
+        err("仓库里找不到 %s (arch=%s)" % (target, ARCH))
+        return 1
+
+    path = pull_and_checkout(ref, pkg_id, real_ver, ARCH, "binary")
+    if not path:
+        return 1
+    info = read_info(path)
+    if not info:
+        err("层内缺少 info.json: %s" % path)
+        return 1
+
+    for dep_key in ("base", "runtime"):
+        dep = info.get(dep_key)
+        if dep and not ensure_dep(dep):
+            err("依赖 %s 安装失败, 应用可能无法启动" % dep)
+
+    idx = load_index()
+    idx["%s/%s/%s/binary" % (pkg_id, real_ver, ARCH)] = {
+        "id": pkg_id, "version": real_ver, "arch": ARCH, "module": "binary",
+        "path": path, "kind": info.get("kind", "app"),
+        "name": info.get("name", pkg_id), "installed_at": int(time.time()),
+    }
+    save_index(idx)
+
+    if info.get("kind", "app") == "app":
+        n = install_entries(pkg_id, real_ver, path)
+        print("已生成 %d 个桌面入口(带 %s 后缀)" % (n, NAME_SUFFIX))
+    print("安装完成: %s %s" % (pkg_id, real_ver))
+    return 0
+
+
+def cmd_uninstall(args):
+    target = None
+    for a in args:
+        if not a.startswith("-"):
+            target = a
+            break
+    if not target:
+        err("用法: ll-cli uninstall <应用ID>")
+        return 1
+    pkg_id = target.split("/", 1)[0]
+    idx = load_index()
+    removed = 0
+    for key in list(idx.keys()):
+        rec = idx[key]
+        if rec.get("id") != pkg_id:
+            continue
+        shutil.rmtree(rec["path"], ignore_errors=True)
+        del idx[key]
+        removed += 1
+    save_index(idx)
+    remove_entries(pkg_id)
+    if removed:
+        print("已卸载 %s" % pkg_id)
+        return 0
+    err("未安装 %s" % pkg_id)
+    return 1
+
+
+# ───────────────────── 桌面入口注入(用户级防覆盖) ─────────────────────
+
+LOCALE_NAME_RE = re.compile(r"^(Name(?:\[[^\]]+\])?)\s*=\s*(.*)$")
+
+
+def install_entries(pkg_id, version, path):
+    """把层里的 .desktop 改写成用户级 override, 名字加 (玲珑) 后缀, Exec 指向本 ll-cli。"""
+    os.makedirs(APPS_DIR, exist_ok=True)
+    src_dirs = [os.path.join(path, "entries", "share", "applications"),
+                os.path.join(path, "files", "share", "applications")]
+    seen = set()
+    count = 0
+    for sd in src_dirs:
+        if not os.path.isdir(sd):
+            continue
+        for fn in sorted(os.listdir(sd)):
+            if not fn.endswith(".desktop") or fn in seen:
+                continue
+            seen.add(fn)
+            try:
+                with open(os.path.join(sd, fn), encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except Exception as e:
+                err("读取 %s 失败: %s" % (fn, e))
+                continue
+            out = rewrite_desktop(lines, pkg_id, version)
+            dest = os.path.join(APPS_DIR, DESKTOP_PREFIX + pkg_id + "-" + fn)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write("\n".join(out) + "\n")
+            os.chmod(dest, 0o644)
+            count += 1
+    install_icons(path)
+    run(["update-desktop-database", APPS_DIR])
+    run(["gtk-update-icon-cache", "-f", "-t", os.path.join(ICONS_DIR, "hicolor")])
+    return count
+
+
+def rewrite_desktop(lines, pkg_id, version):
+    out = []
+    in_entry = False
+    added_mark = False
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            in_entry = (s == "[Desktop Entry]")
+            out.append(line)
+            continue
+        if not in_entry:
+            out.append(line)
+            continue
+
+        m = LOCALE_NAME_RE.match(line)
+        if m:
+            key, val = m.group(1), m.group(2)
+            if not val.endswith(NAME_SUFFIX):
+                val = val + NAME_SUFFIX
+            out.append("%s=%s" % (key, val))
+            continue
+
+        if s.startswith("Exec="):
+            out.append("Exec=" + rewrite_exec(s[5:], pkg_id))
+            continue
+        if s.startswith("TryExec="):
+            out.append("TryExec=/usr/local/bin/ll-cli")
+            continue
+        if s.startswith("DBusActivatable="):
+            out.append("DBusActivatable=false")
+            continue
+        if s.startswith(MARK_KEY + "="):
+            continue
+        out.append(line)
+        if not added_mark and s.startswith("Type="):
+            out.append("%s=%s" % (MARK_KEY, pkg_id))
+            out.append("X-Linyaps-Lite-Version=%s" % version)
+            added_mark = True
+    if not added_mark:
+        out.append("%s=%s" % (MARK_KEY, pkg_id))
+        out.append("X-Linyaps-Lite-Version=%s" % version)
+    return out
+
+
+def rewrite_exec(exec_line, pkg_id):
+    """原始 Exec 形如:
+         /usr/bin/ll-cli run org.deepin.movie -- deepin-movie %U
+       或者裸命令。统一改写成 /usr/local/bin/ll-cli run <id> -- <命令...>"""
+    try:
+        toks = shlex.split(exec_line)
+    except ValueError:
+        toks = exec_line.split()
+    # 去掉前缀的 ll-cli run <id> [--]
+    if toks and os.path.basename(toks[0]) == "ll-cli":
+        toks = toks[1:]
+        if toks and toks[0] == "run":
+            toks = toks[1:]
+        if toks and not toks[0].startswith("-"):
+            toks = toks[1:]          # <id>
+        if toks and toks[0] == "--":
+            toks = toks[1:]
+    tail = " ".join(shlex.quote(t) if (" " in t) else t for t in toks)
+    if tail:
+        return "/usr/local/bin/ll-cli run %s -- %s" % (pkg_id, tail)
+    return "/usr/local/bin/ll-cli run %s" % pkg_id
+
+
+def install_icons(path):
+    for sub in ("entries/share/icons", "files/share/icons"):
+        src = os.path.join(path, sub)
+        if not os.path.isdir(src):
+            continue
+        for dirpath, _dirs, files in os.walk(src):
+            rel = os.path.relpath(dirpath, src)
+            dst = os.path.join(ICONS_DIR, rel) if rel != "." else ICONS_DIR
+            os.makedirs(dst, exist_ok=True)
+            for fn in files:
+                try:
+                    shutil.copy2(os.path.join(dirpath, fn), os.path.join(dst, fn))
+                except Exception:
+                    pass
+    # pixmaps 里的图标也捞一份
+    for sub in ("entries/share/pixmaps", "files/share/pixmaps"):
+        src = os.path.join(path, sub)
+        if os.path.isdir(src):
+            dst = os.path.join(ICONS_DIR, "hicolor", "48x48", "apps")
+            os.makedirs(dst, exist_ok=True)
+            for fn in os.listdir(src):
+                try:
+                    shutil.copy2(os.path.join(src, fn), os.path.join(dst, fn))
+                except Exception:
+                    pass
+
+
+def remove_entries(pkg_id):
+    if not os.path.isdir(APPS_DIR):
+        return
+    for fn in os.listdir(APPS_DIR):
+        if not fn.endswith(".desktop"):
+            continue
+        p = os.path.join(APPS_DIR, fn)
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+        except Exception:
+            continue
+        if ("%s=%s" % (MARK_KEY, pkg_id)) in txt:
+            os.remove(p)
+    run(["update-desktop-database", APPS_DIR])
+
+
+# ───────────────────────── 运行(无容器) ─────────────────────────
+
+def find_installed(pkg_id, version=None):
+    idx = load_index()
+    best = None
+    for rec in idx.values():
+        if rec.get("id") != pkg_id:
+            continue
+        if version and rec["version"] != version:
+            continue
+        if not os.path.isdir(rec["path"]):
+            continue
+        if best is None or vkey(rec["version"]) > vkey(best["version"]):
+            best = rec
+    return best
+
+
+def libdirs(base):
+    """返回一个层 files/ 下所有值得进 library-path 的目录。"""
+    out = []
+    for d in ("lib/aarch64-linux-gnu", "lib", "usr/lib/aarch64-linux-gnu", "usr/lib",
+              "lib64", "usr/lib64"):
+        p = os.path.join(base, d)
+        if os.path.isdir(p):
+            out.append(p)
+    return out
+
+
+SONAME_RE = re.compile(r"^lib.+\.so(\.[0-9]+)*$")
+
+
+def private_libdirs(base):
+    """层里 lib/<triplet>/ 下放私有库的一级子目录(典型: pulseaudio/libpulsecommon-17.0.so)。
+    这类库不在普通 lib 目录, 靠 DT_RUNPATH=/usr/lib/<triplet>/<子目录> 定位 —— 有容器时
+    /usr 就是 base 层, 而我们【没有容器】, 那个绝对路径会落到宿主(宿主只有别的版本或没有)
+    → "libpulsecommon-17.0.so: cannot open shared object file", 连带 libmpv 整个加载失败。
+    放在 library-path 最末尾: 只接住本来会漏到宿主的查找, 不遮挡任何已有库。
+    按"目录里有 lib*.so*"判定, 不写死任何目录名, 所以对 pipewire/libproxy/alsa-lib 等同样生效。"""
+    out = []
+    for d in ("lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu"):
+        top = os.path.join(base, d)
+        try:
+            names = sorted(os.listdir(top))
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(top, n)
+            if os.path.islink(p) or not os.path.isdir(p):
+                continue
+            try:
+                if any(SONAME_RE.match(f) for f in os.listdir(p)):
+                    out.append(p)
+            except OSError:
+                pass
+    return out
+
+
+def _bus_usable(addr):
+    """unix:path= 形式要 socket 还在才算可用; 其它形式(abstract/tcp)没法廉价判活, 视为可用。"""
+    for part in (addr or "").split(";"):
+        if not part:
+            continue
+        kind, _, rest = part.partition(":")
+        kv = dict(x.split("=", 1) for x in rest.split(",") if "=" in x)
+        if kind == "unix" and "path" in kv:
+            if os.path.exists(kv["path"]):
+                return True
+            continue
+        return True
+    return False
+
+
+def _norm_display(d):
+    m = re.match(r"^(.*:\d+)(\.\d+)?$", d or "")
+    return m.group(1) if m else (d or "")
+
+
+SESSION_MANAGERS = ("xfce4-session", "gnome-session-b", "mate-session", "lxqt-session",
+                    "lxsession", "startplasma-x11", "ksmserver", "startdde", "dde-session")
+
+
+def session_bus_of_display(display):
+    """从目标 DISPLAY 上正在运行的桌面会话进程的 /proc/<pid>/environ 取会话总线地址。
+    ★不能放任应用自己 autolaunch: 那会 fork 宿主 /usr/bin/dbus-launch, 而它继承了我们给
+      应用设的 LD_LIBRARY_PATH(层里的 libc) → 宿主 ld.so 配 deepin libc → 直接崩,
+      日志就是 "dbus-launch terminated abnormally"。
+    会话管理器(xfce4-session 等)优先, 其次同 DISPLAY 的任意带地址进程。
+    只按 DISPLAY 匹配, 不跨显示借用(:1 与 :2 两套会话各自独立)。"""
+    want = _norm_display(display)
+    fallback = None
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open("/proc/%s/environ" % pid, "rb") as f:
+                envb = f.read()
+        except Exception:
+            continue
+        disp = addr = None
+        for kv in envb.split(b"\0"):
+            if kv.startswith(b"DISPLAY="):
+                disp = kv[8:].decode("utf-8", "replace")
+            elif kv.startswith(b"DBUS_SESSION_BUS_ADDRESS="):
+                addr = kv[25:].decode("utf-8", "replace")
+        if not addr or _norm_display(disp) != want or not _bus_usable(addr):
+            continue
+        try:
+            with open("/proc/%s/comm" % pid, encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip()
+        except Exception:
+            comm = ""
+        if comm in SESSION_MANAGERS:
+            return addr, "%s(%s)" % (comm, pid)
+        if fallback is None:
+            fallback = (addr, "%s(%s)" % (comm, pid))
+    return fallback or (None, None)
+
+
+GPU_ENV_SH = os.path.join(HOME, ".config/desktop-env/gpu.sh")
+
+
+def apply_gpu_env(env):
+    """GPU 口径与其它应用(Firefox/VLC/Electron)保持一致: source desktop-env/gpu.sh 取增量。
+    这样 GPU_OFF=1 逃生开关、Vulkan ICD、vblank_mode 等改了一处就全体生效。"""
+    if os.path.isfile(GPU_ENV_SH):
+        try:
+            p = subprocess.run(["bash", "-c", ". %s >/dev/null 2>&1; env -0" % shlex.quote(GPU_ENV_SH)],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               env=env, timeout=20)
+            if p.returncode == 0:
+                for kv in p.stdout.split(b"\0"):
+                    if not kv:
+                        continue
+                    k, _, v = kv.decode("utf-8", "replace").partition("=")
+                    if k and k not in ("_", "SHLVL", "PWD", "OLDPWD") and env.get(k) != v:
+                        env[k] = v
+        except Exception:
+            pass
+    # gpu.sh 目前不全局设 MESA_LOADER_DRIVER_OVERRIDE(VNC DRI3 没配好前会崩); 这里与
+    # electron-gpu.sh 口径一致: :1(Xtigervnc-dri3) 和 :2(Termux:X11) 都走 kgsl 原生, 不要落到 zink。
+    if env.get("LIBGL_ALWAYS_SOFTWARE") != "1":
+        env.setdefault("MESA_LOADER_DRIVER_OVERRIDE", "kgsl")
+
+
+
+def cmd_run(args):
+    if not args:
+        err("用法: ll-cli run <应用ID> [-- 命令 参数...]")
+        return 1
+    pkg_id = None
+    extra = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            extra = args[i + 1:]
+            break
+        if not a.startswith("-") and pkg_id is None:
+            pkg_id = a
+        i += 1
+    if pkg_id is None:
+        err("缺少应用 ID")
+        return 1
+    if "/" in pkg_id:
+        pkg_id, ver = pkg_id.split("/", 1)
+    else:
+        ver = None
+
+    rec = find_installed(pkg_id, ver)
+    if not rec:
+        err("未安装 %s" % pkg_id)
+        return 1
+    app = rec["path"]
+    info = read_info(app) or {}
+
+    base_path = ensure_dep(info["base"], quiet=True) if info.get("base") else None
+    rt_path = ensure_dep(info["runtime"], quiet=True) if info.get("runtime") else None
+    if not base_path:
+        err("缺少 base 层, 无法运行")
+        return 1
+
+    app_f = os.path.join(app, "files")
+    base_f = os.path.join(base_path, "files")
+    rt_f = os.path.join(rt_path, "files") if rt_path else None
+
+    layers_f = [app_f] + ([rt_f] if rt_f else []) + [base_f]
+    libpath, seen = [], set()
+    for p in ([d for f in layers_f for d in libdirs(f)] +
+              [d for f in layers_f for d in private_libdirs(f)]):
+        rp = os.path.realpath(p)        # base 层 lib -> usr/lib 是符号链接, 按真实路径去重
+        if rp not in seen:
+            seen.add(rp)
+            libpath.append(p)
+    libpath_s = ":".join(libpath)
+
+    # 命令 (去掉 .desktop 的 %U/%f 之类字段码)
+    cmd = extra or info.get("command") or [pkg_id]
+    cmd = [c for c in cmd if not re.fullmatch(r"%[a-zA-Z]", c)]
+    if not cmd:
+        cmd = info.get("command") or [pkg_id]
+    exe = cmd[0]
+    argv_rest = cmd[1:]
+    if not os.path.isabs(exe):
+        for d in (os.path.join(app_f, "bin"), os.path.join(rt_f or "", "bin"),
+                  os.path.join(base_f, "bin"), os.path.join(base_f, "usr/bin")):
+            c = os.path.join(d, exe)
+            if os.path.isfile(c):
+                exe = c
+                break
+    if not os.path.isfile(exe):
+        err("找不到可执行文件: %s" % cmd[0])
+        return 1
+
+    # 动态链接器: 优先用 base 层自带的, 避免宿主 glibc 与 deepin 库版本打架
+    ldso = None
+    for c in (os.path.join(base_f, "lib/ld-linux-aarch64.so.1"),
+              os.path.join(base_f, "lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"),
+              os.path.join(base_f, "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"),
+              os.path.join(base_f, "lib64/ld-linux-aarch64.so.1")):
+        if os.path.isfile(c):
+            ldso = c
+            break
+
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = libpath_s + (":" + env["LD_LIBRARY_PATH"]
+                                          if env.get("LD_LIBRARY_PATH") else "")
+    env.pop("LD_PRELOAD", None)          # 别把玲珑商店的 no_impeller 垫片带进来
+    # ★login1 桩垫片: proot 里没有 systemd-logind, 系统总线激活 org.freedesktop.login1 必然失败。
+    #   很多 DTK 应用(实测深度影院)拿 ListSessions 的结果时【不判空】就取最后一项拼单例键
+    #   → 空 QList 上 ptr[size-1] → 段错误(退出码 139)。垫片只在真实回复是错误时才伪造一条
+    #   会话记录, 真机上 logind 正常时自动不介入。LINGLONG_LITE_NO_SHIM=1 可关掉。
+    if not env.get("LINGLONG_LITE_NO_SHIM") and os.path.isfile(LOGIN1_SHIM):
+        env["LD_PRELOAD"] = LOGIN1_SHIM
+
+    datadirs = [os.path.join(app_f, "share")]
+    if rt_f:
+        datadirs.append(os.path.join(rt_f, "share"))
+    datadirs += [os.path.join(base_f, "usr/share"), os.path.join(base_f, "share")]
+    datadirs = [d for d in datadirs if os.path.isdir(d)]
+    env["XDG_DATA_DIRS"] = ":".join(datadirs + [env.get("XDG_DATA_DIRS",
+                                                        "/usr/local/share:/usr/share")])
+
+    qt_plugins = []
+    for b in ([rt_f] if rt_f else []) + [base_f, app_f]:
+        for d in ("lib/aarch64-linux-gnu/qt6/plugins", "lib/aarch64-linux-gnu/qt5/plugins",
+                  "usr/lib/aarch64-linux-gnu/qt6/plugins", "usr/lib/aarch64-linux-gnu/qt5/plugins",
+                  "lib/aarch64-linux-gnu/plugins", "plugins"):
+            p = os.path.join(b, d)
+            if os.path.isdir(p):
+                qt_plugins.append(p)
+    if qt_plugins:
+        env["QT_PLUGIN_PATH"] = ":".join(qt_plugins)
+        for p in qt_plugins:
+            pf = os.path.join(p, "platforms")
+            if os.path.isdir(pf):
+                env["QT_QPA_PLATFORM_PLUGIN_PATH"] = pf
+                break
+    qml = []
+    for b in ([rt_f] if rt_f else []) + [base_f, app_f]:
+        for d in ("lib/aarch64-linux-gnu/qt6/qml", "lib/aarch64-linux-gnu/qt5/qml",
+                  "usr/lib/aarch64-linux-gnu/qt6/qml", "usr/lib/aarch64-linux-gnu/qt5/qml"):
+            p = os.path.join(b, d)
+            if os.path.isdir(p):
+                qml.append(p)
+    if qml:
+        env["QML2_IMPORT_PATH"] = ":".join(qml)
+        env["QML_IMPORT_PATH"] = ":".join(qml)
+
+    env.setdefault("QT_QPA_PLATFORM", "xcb")
+    env["LINGLONG_APPID"] = pkg_id
+    env["LINGLONG_LITE"] = "1"
+    env.setdefault("DISPLAY", ":1")
+    # 会话总线: 调用者已有可用地址(从桌面菜单启动时会继承)就沿用; 否则照目标 DISPLAY
+    # 去桌面会话进程的 environ 里取。不能让应用自己 dbus-launch(见 session_bus_of_display)。
+    if not _bus_usable(env.get("DBUS_SESSION_BUS_ADDRESS")):
+        addr, src = session_bus_of_display(env["DISPLAY"])
+        if addr:
+            env["DBUS_SESSION_BUS_ADDRESS"] = addr
+            log("run %s: 会话总线取自 %s" % (pkg_id, src))
+        else:
+            env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+            log("run %s: DISPLAY=%s 上没找到桌面会话总线" % (pkg_id, env["DISPLAY"]))
+    # 系统总线(UPower/login1 等)按 socket 存在才设, 与 desktop-env/apps.sh 口径一致
+    if not _bus_usable(env.get("DBUS_SYSTEM_BUS_ADDRESS")) and \
+            os.path.exists("/run/dbus/system_bus_socket"):
+        env["DBUS_SYSTEM_BUS_ADDRESS"] = "unix:path=/run/dbus/system_bus_socket"
+    apply_gpu_env(env)
+
+    argv = ([ldso, "--library-path", libpath_s, exe] if ldso else [exe]) + argv_rest
+    log("run %s -> %s" % (pkg_id, " ".join(argv[:6])))
+    try:
+        os.execve(argv[0], argv, env)
+    except Exception as e:
+        err("启动失败: %s" % e)
+        return 1
+
+
+# ───────────────────────── 查询类(JSON) ─────────────────────────
+
+def pkg_entry(rec):
+    info = read_info(rec["path"]) or {}
+    arch = info.get("arch") or [rec.get("arch", ARCH)]
+    if isinstance(arch, str):
+        arch = [arch]
+    return {
+        "id": info.get("id", rec["id"]),
+        "appId": info.get("id", rec["id"]),
+        "appid": info.get("id", rec["id"]),
+        "name": info.get("name", rec.get("name", rec["id"])),
+        "version": info.get("version", rec["version"]),
+        "arch": arch,
+        "channel": info.get("channel", CHANNEL),
+        "module": info.get("module", rec.get("module", "binary")),
+        "kind": info.get("kind", rec.get("kind", "app")),
+        "base": info.get("base", ""),
+        "runtime": info.get("runtime", ""),
+        "description": info.get("description", ""),
+        "size": info.get("size", 0),
+        "schema_version": info.get("schema_version", "1.0"),
+        "packageName": info.get("name", rec["id"]),
+        "user": os.environ.get("USER", "root"),
+        "repo": DEFAULT_REPO_NAME,
+    }
+
+
+def cmd_list(args, as_json):
+    idx = load_index()
+    want_all = "--all" in args
+    apps = []
+    for rec in sorted(idx.values(), key=lambda r: (r["id"], r["version"])):
+        if not os.path.isdir(rec["path"]):
+            continue
+        e = pkg_entry(rec)
+        if not want_all and e["kind"] != "app":
+            # 默认只列应用; base/runtime 用 --all 才显示(与 ll-cli 行为一致)
+            pass
+        apps.append(e)
+    if as_json:
+        print(json.dumps(apps, ensure_ascii=False, indent=4))
+    else:
+        if not apps:
+            print("没有已安装的应用")
+        for e in apps:
+            print("%-38s %-18s %-8s %s" % (e["id"], e["version"], e["module"], e["name"]))
+    return 0
+
+
+def running_procs():
+    procs = []
+    idx = load_index()
+    ids = {rec["id"] for rec in idx.values()}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/environ" % pid, "rb") as f:
+                envb = f.read()
+        except Exception:
+            continue
+        appid = None
+        for kv in envb.split(b"\0"):
+            if kv.startswith(b"LINGLONG_APPID="):
+                appid = kv.split(b"=", 1)[1].decode("utf-8", "replace")
+                break
+        if not appid or appid not in ids:
+            continue
+        rec = find_installed(appid)
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmdline = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except Exception:
+            cmdline = appid
+        procs.append({
+            "id": appid,
+            "appId": appid,
+            "pid": int(pid),
+            "package": "%s:%s/%s/%s/binary" % (CHANNEL, appid,
+                                               rec["version"] if rec else "", ARCH),
+            "name": rec["name"] if rec else appid,
+            "version": rec["version"] if rec else "",
+            "cmd": cmdline,
+            "state": "running",
+            "user": os.environ.get("USER", "root"),
+        })
+    return procs
+
+
+def cmd_ps(args, as_json):
+    procs = running_procs()
+    if as_json:
+        print(json.dumps(procs, ensure_ascii=False, indent=4))
+    else:
+        print("%-10s %-38s %s" % ("PID", "APPID", "NAME"))
+        for p in procs:
+            print("%-10d %-38s %s" % (p["pid"], p["id"], p["name"]))
+    return 0
+
+
+def cmd_repo(args, as_json):
+    sub = args[0] if args else "show"
+    if sub in ("show", "list", ""):
+        data = {
+            "code": 0,
+            "message": "",
+            "defaultRepo": DEFAULT_REPO_NAME,
+            "repos": [{
+                "alias": DEFAULT_REPO_NAME,
+                "name": DEFAULT_REPO_NAME,
+                "url": DEFAULT_REPO_URL,
+                "priority": 0,
+            }],
+        }
+        if as_json:
+            print(json.dumps(data, ensure_ascii=False, indent=4))
+        else:
+            print("Default repository: %s" % DEFAULT_REPO_NAME)
+            print("%-12s %-8s %s" % ("Alias", "Priority", "Url"))
+            print("%-12s %-8d %s" % (DEFAULT_REPO_NAME, 0, DEFAULT_REPO_URL))
+        return 0
+    if as_json:
+        print(json.dumps({"code": 0, "message": ""}, ensure_ascii=False))
+    return 0
+
+
+def cmd_search(args, as_json):
+    kw = None
+    for a in args:
+        if not a.startswith("-"):
+            kw = a
+            break
+    refs = remote_refs()
+    seen = {}
+    pat = re.compile(r"^%s/([^/]+)/([^/]+)/%s/binary$" % (re.escape(CHANNEL), re.escape(ARCH)))
+    for r in refs:
+        m = pat.match(r)
+        if not m:
+            continue
+        pid, ver = m.group(1), m.group(2)
+        if kw and kw.lower() not in pid.lower():
+            continue
+        if pid not in seen or vkey(ver) > vkey(seen[pid]):
+            seen[pid] = ver
+    items = [{"id": k, "appId": k, "name": k, "version": v, "arch": [ARCH],
+              "channel": CHANNEL, "module": "binary", "kind": "app",
+              "description": "", "size": 0} for k, v in sorted(seen.items())]
+    if as_json:
+        print(json.dumps(items, ensure_ascii=False, indent=4))
+    else:
+        for it in items:
+            print("%-40s %s" % (it["id"], it["version"]))
+    return 0
+
+
+def cmd_info(args, as_json):
+    target = None
+    for a in args:
+        if not a.startswith("-"):
+            target = a
+            break
+    if not target:
+        err("用法: ll-cli info <应用ID>")
+        return 1
+    rec = find_installed(target.split("/", 1)[0])
+    if not rec:
+        err("未安装 %s" % target)
+        return 1
+    e = pkg_entry(rec)
+    if as_json:
+        print(json.dumps(e, ensure_ascii=False, indent=4))
+    else:
+        for k in ("id", "name", "version", "kind", "base", "runtime", "description"):
+            print("%-12s %s" % (k + ":", e[k]))
+    return 0
+
+
+def cmd_kill(args):
+    target = args[0] if args else None
+    if not target:
+        err("用法: ll-cli kill <应用ID>")
+        return 1
+    n = 0
+    for p in running_procs():
+        if p["id"] == target:
+            try:
+                os.kill(p["pid"], 15)
+                n += 1
+            except Exception:
+                pass
+    print("已结束 %d 个进程" % n)
+    return 0
+
+
+def cmd_prune(as_json):
+    """清理没有被任何已装应用引用的 base/runtime 层。"""
+    idx = load_index()
+    needed = set()
+    for rec in idx.values():
+        info = read_info(rec["path"]) or {}
+        for k in ("base", "runtime"):
+            if info.get(k):
+                needed.add(parse_dep(info[k])[0])
+    removed = []
+    for key in list(idx.keys()):
+        rec = idx[key]
+        if rec.get("kind") == "app":
+            continue
+        if rec["id"] not in needed:
+            shutil.rmtree(rec["path"], ignore_errors=True)
+            removed.append(rec["id"] + "/" + rec["version"])
+            del idx[key]
+    save_index(idx)
+    if as_json:
+        print(json.dumps({"code": 0, "message": "", "removed": removed}, ensure_ascii=False))
+    else:
+        print("已清理 %d 个无用层" % len(removed))
+    return 0
+
+
+def cmd_upgrade(args):
+    idx = load_index()
+    targets = [a for a in args if not a.startswith("-")]
+    ids = targets or sorted({r["id"] for r in idx.values() if r.get("kind") == "app"})
+    rc = 0
+    for pid in ids:
+        rec = find_installed(pid)
+        ref, newv = resolve_ref(pid)
+        if not ref:
+            continue
+        if rec and vkey(newv) <= vkey(rec["version"]):
+            print("%s 已是最新 (%s)" % (pid, rec["version"]))
+            continue
+        print("升级 %s: %s -> %s" % (pid, rec["version"] if rec else "-", newv))
+        rc |= cmd_install([pid])
+    return rc
+
+
+# ───────────────────────── 入口 ─────────────────────────
+
+HELP = """ll-cli (linyaps-lite %s) —— proot 环境下的无容器玲珑包管理器
+
+用法:
+  ll-cli install   <应用ID>[/版本]      下载并安装(自动带 base/runtime, 自动生成桌面入口)
+  ll-cli uninstall <应用ID>             卸载并清掉桌面入口
+  ll-cli run       <应用ID> [-- 命令]   运行(不用 bwrap)
+  ll-cli list      [--json] [--all]     已安装列表
+  ll-cli ps        [--json]             运行中的玲珑进程
+  ll-cli kill      <应用ID>             结束进程
+  ll-cli search    <关键词> [--json]    搜索远端仓库
+  ll-cli info      <应用ID> [--json]    包信息
+  ll-cli repo show [--json]             仓库配置
+  ll-cli upgrade   [应用ID...]          升级
+  ll-cli prune     [--json]             清理无用 base/runtime
+  ll-cli --version                      版本
+
+注意: 这是给 proot(无用户命名空间) 环境写的替身实现, 没有容器隔离。
+""" % VERSION
+
+
+def main():
+    argv = sys.argv[1:]
+    log("argv=%r cwd=%s" % (argv, os.getcwd()))
+    as_json = "--json" in argv
+    argv = [a for a in argv if a != "--json"]
+
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(HELP)
+        return 0
+    cmd = argv[0]
+    rest = argv[1:]
+
+    if cmd in ("--version", "-V", "version"):
+        if as_json:
+            print(json.dumps({"code": 0, "message": "", "version": VERSION},
+                             ensure_ascii=False))
+        else:
+            print("ll-cli version: %s" % VERSION)
+            print("ll-cli %s" % VERSION)
+        return 0
+    if cmd == "--print-architecture":
+        print(ARCH)
+        return 0
+
+    try:
+        if cmd == "install":
+            return cmd_install(rest)
+        if cmd in ("uninstall", "remove"):
+            return cmd_uninstall(rest)
+        if cmd == "run":
+            return cmd_run(rest)
+        if cmd == "list":
+            return cmd_list(rest, as_json)
+        if cmd == "ps":
+            return cmd_ps(rest, as_json)
+        if cmd == "repo":
+            return cmd_repo(rest, as_json)
+        if cmd == "search":
+            return cmd_search(rest, as_json)
+        if cmd == "info":
+            return cmd_info(rest, as_json)
+        if cmd == "kill":
+            return cmd_kill(rest)
+        if cmd == "prune":
+            return cmd_prune(as_json)
+        if cmd == "upgrade":
+            return cmd_upgrade(rest)
+        if cmd == "enter":
+            err("proot 环境下没有容器, 不支持 ll-cli enter")
+            return 1
+    except KeyboardInterrupt:
+        return 130
+
+    err("未知子命令: %s" % cmd)
+    print(HELP)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

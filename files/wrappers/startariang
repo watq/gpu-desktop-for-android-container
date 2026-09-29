@@ -1,0 +1,56 @@
+#!/bin/bash
+# ════════════════════════════════════════════════════════════════
+# startariang —— 启动 aria2 RPC 守护 + 打开 AriaNg 前端
+# 生成 2026-09-22
+#
+# 背景: /usr/share/applications/ariang.desktop 的 Exec 指向本文件, 但本文件原本
+#   【不存在】(AriaNg 网页文件也没装, 只剩 desktop + icon) → 点图标报找不到可执行文件。
+# ★ 同时修复了 /usr/bin/aria2c 曾被替换成 wget 包装脚本的问题(真二进制已 apt reinstall 恢复,
+#   包装备份在 /root/工具箱/backup/aria2c.wget-shim.*)。
+#
+# AriaNg 是纯前端 SPA, 通过 RPC(6800) 控制本机 aria2。页面来源二选一:
+#   ① 本地单文件  /usr/local/share/ariang/index.html (若已下载)
+#   ② 在线官方版  http://ariang.mayswind.net (同样连本机 6800, 无需下载)
+# ════════════════════════════════════════════════════════════════
+set -u
+# ★ 2026-09-23: RPC 配置已从 aria2c 默认路径 /root/.aria2/aria2.conf 搬到 ariang-rpc.conf。
+#   原因: 星火商店/其它一次性 aria2c 会默认读 ~/.aria2/aria2.conf, 吃到 enable-rpc=true
+#   后进入 RPC 守护模式, 下载卡在 0B/0B → "无限下载失败"。搬走后各走各的, 互不干扰。
+CONF=/root/.aria2/ariang-rpc.conf
+LOCAL=/usr/local/share/ariang/index.html
+ONLINE=http://ariang.mayswind.net
+
+# ① 起 aria2 RPC(幂等: 已在跑就不重复起)
+if pgrep -x aria2c >/dev/null 2>&1; then
+  echo "[i] aria2c 已在运行"
+else
+  [ -f "$CONF" ] || { echo "[✘] 缺配置 $CONF"; exit 1; }
+  mkdir -p /root/Downloads
+  setsid aria2c --conf-path="$CONF" >/tmp/aria2c.log 2>&1 &
+  disown 2>/dev/null || true
+  sleep 2
+  if pgrep -x aria2c >/dev/null 2>&1; then
+    echo "[OK] aria2 RPC 已启动 (端口 6800, 下载目录 /root/Downloads)"
+  else
+    echo "[✘] aria2 没起来, 日志:"; tail -5 /tmp/aria2c.log; exit 1
+  fi
+fi
+
+# ② DISPLAY 自动挑(:2 优先)
+if [ -z "${DISPLAY:-}" ]; then
+  [ -e /tmp/.X11-unix/X2 ] && export DISPLAY=:2 || export DISPLAY=:1
+fi
+
+# ③ 打开前端
+if [ -s "$LOCAL" ] && [ "$(stat -c%s "$LOCAL")" -gt 500000 ]; then
+  URL="file://$LOCAL"; echo "[i] 用本地 AriaNg: $LOCAL"
+else
+  URL="$ONLINE"
+  echo "[i] 本地无完整 AriaNg 单文件 → 用在线版 $ONLINE"
+  echo "    (想离线用: 下载 AriaNg-*-AllInOne.html 存为 $LOCAL)"
+fi
+
+if command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL" >/dev/null 2>&1 &
+elif command -v firefox >/dev/null 2>&1; then firefox "$URL" >/dev/null 2>&1 &
+else echo "[!] 没有浏览器, 请手动访问: $URL"; fi
+echo "[i] aria2 RPC: http://127.0.0.1:6801/jsonrpc"
