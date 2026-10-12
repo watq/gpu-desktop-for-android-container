@@ -28,6 +28,15 @@
 #   ln -sfn /opt/durapps/spark-store/bin/aptss     /usr/local/bin/aptss
 #   ln -sfn /opt/durapps/spark-store/bin/ssinstall /usr/bin/ssinstall
 #   ln -sfn /opt/durapps/spark-store/bin/ssinstall /usr/local/bin/ssinstall
+#   ln -sfn /opt/durapps/spark-store/bin/spark-store /usr/local/bin/spark-store
+#
+# ★2026-10-04 补 spark-store 本身(此前漏网, 详见临时账本 wip/localbin2.20261003/):
+#   postinst 第 35 行 `ln -s -f /opt/durapps/spark-store/bin/spark-store /usr/local/bin/spark-store`
+#   把这个入口指回【dpkg 的裸壳】, 于是:
+#     /root/.local/bin/spark-store -> spark-store-wrap.sh        ← 有 GPU/花屏修复
+#     /usr/local/bin/spark-store   -> /opt/durapps/.../spark-store ← 绕过包装, 无修复
+#   同一个命令两种行为。本脚本原来只管 aptss / ssinstall, 没管 spark-store, 所以每次
+#   星火升级后这条就回到裸壳。现已纳入自愈。
 # ══════════════════════════════════════════════════════════════════════
 set -u
 SHIM=/root/.local/lib/spark-shim
@@ -54,8 +63,28 @@ link_one() {
   return 0
 }
 
+# 启动期只修复 spark-store.postinst 明确创建的入口。默认安装收尾模式不变。
+# 严格比较 readlink 的字面目标：未知软链、普通文件、缺失入口均留给用户。
+if [ "${1:-}" = --known-package-links ]; then
+  link_package_one() {
+    local body="$1" entry="$2" package_target="$3" current
+    [ -x "$body" ] && [ -L "$entry" ] || return 0
+    current=$(readlink "$entry" 2>/dev/null) || return 0
+    [ "$current" = "$package_target" ] || return 0
+    link_one "$body" "$entry"
+  }
+  link_package_one "$SHIM/aptss" /usr/bin/aptss /opt/durapps/spark-store/bin/aptss
+  link_package_one "$SHIM/ssinstall" /usr/bin/ssinstall /opt/durapps/spark-store/bin/ssinstall
+  link_package_one "$SHIM/ssinstall" /usr/local/bin/ssinstall /opt/durapps/spark-store/bin/ssinstall
+  link_package_one "$SHIM/spark-store-wrap.sh" /usr/local/bin/spark-store /opt/durapps/spark-store/bin/spark-store
+  exit 0
+fi
+
 link_one "$SHIM/aptss"     /usr/bin/aptss
 link_one "$SHIM/aptss"     /usr/local/bin/aptss
 link_one "$SHIM/ssinstall" /usr/bin/ssinstall
 link_one "$SHIM/ssinstall" /usr/local/bin/ssinstall
+# ★2026-10-04 新增: 星火主程序入口本身。两个入口必须指同一个包装, 否则
+#   "显式敲 /usr/local/bin/spark-store" 或"任何不走用户 PATH 的调用方"拿到的是无修复的裸壳。
+link_one "$SHIM/spark-store-wrap.sh" /usr/local/bin/spark-store
 exit 0

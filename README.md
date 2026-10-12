@@ -293,6 +293,18 @@ A/B（视频窗固定 1920×1080，3 轮交替 ±0.06fps，另 4 次独立复现
 
 ---
 
+## 已知问题
+
+以下区分历史复验结果与仍需验证的部分，不代表所有应用、素材及 Android 前后台切换场景均已覆盖。
+
+| 问题 | 状态 |
+| :-- | :-- |
+| 播放器黑帧 | 上文列出的呈现路径调整在历史 6 组 × 320 帧测试中均为 0 事件；其他素材及 Android surface 重建场景仍需单独复验，不能据此判定所有黑屏已解决。 |
+| Chrome 148 硬件路径 | 此前测试受 DRM render node 的 `EACCES` 阻挡，未验证恢复。 |
+| VNC 侧 Vulkan swapchain | 已有补丁的历史测试慢 3.4 倍，当前配方使用 `MESA_VK_WSI_DEBUG=sw`。 |
+
+---
+
 ## 致谢
 
 - [**lfdevs/mesa-for-android-container**](https://github.com/lfdevs/mesa-for-android-container) —— Android 容器可用的 Mesa 构建，本项目的 GPU 地基。本仓 README 的组织方式也参考了它。

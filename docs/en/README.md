@@ -209,8 +209,8 @@ files/desktop-env/cursor-sync.sh :1 :2
 
 | Issue | Status |
 | :-- | :-- |
-| **Black frames in video players** — with GPU presentation, 20–40% of frames come out entirely black on both displays | Unresolved. Narrowed to two candidates: Mesa's kgsl EGL/WSI clearing on swap, or Xvnc-dri3 / Xlorie mmap-ing the dmabuf `PROT_READ` without a cache invalidate. Three user-level workarounds are prepared (x11/xcb output for the players, software presentation for mpv) but not merged. |
-| **Hardware path on Chrome 148** | Blocked by `EACCES` on the DRM render node; judged not worth pursuing further. |
+| **Black frames in video players** | The presentation-path adjustments documented in the [Chinese README](../../README.md#已知问题) produced zero events in the historical 6 × 320-frame tests. Other media and Android surface-recreation scenarios still need separate verification; this does not establish that every black-screen issue is resolved. |
+| **Hardware path on Chrome 148** | Earlier tests were blocked by `EACCES` on the DRM render node; recovery has not been verified. |
 | **Vulkan swapchain on the VNC side** | A working patch exists but runs 3.4× slower; `MESA_VK_WSI_DEBUG=sw` is used instead. |
 
 ---

@@ -20,13 +20,24 @@ export XMODIFIERS=@im=ibus
 export QT4_IM_MODULE=ibus
 export CLUTTER_IM_MODULE=ibus
 
-# 幂等拉起 ibus-daemon(proot 无 systemd, 只能自己起)
-# ★用方括号写法防止 pgrep 匹配到调用它的 shell 自身(本项目踩过 exit 144 的坑)
+# 按真实可执行文件、DISPLAY 和会话总线判重；其他桌面的 ibus 不算本会话实例。
 im_start() {
-  if pgrep -f '[i]bus-daemon' >/dev/null 2>&1; then
-    return 0
-  fi
-  # -d 后台 -r 替换已有 -x 启动 XIM -n 指定面板
-  ibus-daemon -drx >/tmp/ibus-daemon.log 2>&1 &
+  local p exe entry dp bus target=${DISPLAY:-}
+  [ -n "$target" ] && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 1
+  target=${target%.0}
+  for p in /proc/[0-9]*; do
+    exe=$(readlink "$p/exe" 2>/dev/null) || continue
+    [ "${exe##*/}" = ibus-daemon ] || continue
+    dp= bus=
+    while IFS= read -r -d '' entry; do
+      case "$entry" in
+        DISPLAY=*) dp=${entry#DISPLAY=} ;;
+        DBUS_SESSION_BUS_ADDRESS=*) bus=${entry#DBUS_SESSION_BUS_ADDRESS=} ;;
+      esac
+    done 2>/dev/null < "$p/environ"
+    [ "${dp%.0}" = "$target" ] && [ "$bus" = "$DBUS_SESSION_BUS_ADDRESS" ] && return 0
+  done
+  # 不使用 -r，避免替换已占用当前 XIM selection 的其他会话。
+  ibus-daemon -dx >/tmp/ibus-daemon-${target//[^a-zA-Z0-9]/_}.log 2>&1 &
   sleep 1
 }

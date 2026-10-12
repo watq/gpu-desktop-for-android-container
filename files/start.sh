@@ -47,15 +47,17 @@ info() {
 	fi
 	return 0
 }
-# ① 唤醒锁 —— 【2026-09-22 用户实测: 已关闭, 因为它拉起系统"电量详情/省电策略"弹窗】
+# ① 唤醒锁 —— 现役保持启用；以下 2026-09-22 关闭记录仅为历史。
 #   ★归因(用户更正): 不是下面这句写法的问题, 是【termux-wake-lock 这个动作本身】在
 #     新版 ZeroTermux/Termux 里就会触发电量详情(新版引进的行为, 老版本不会)。
 #     换句话说: 直接裸跑 termux-wake-lock 也照弹, 与 timeout/command -v 包装无关。
-#   且历史已记"锁不能阻止 MIUI Greezer 冻结" → 纯招弹窗无收益, 故整段注释掉。
-#   (与 ~/.zshrc 里那处自动持锁同因, 两处都已关)
+#   历史曾因"锁不能阻止 MIUI Greezer 冻结"及弹窗关闭；当前代码已恢复启用。
+#   本轮不改变持锁设置；EXIT 统一解锁，INT/TERM 分别以 130/143 退出。
  command -v termux-wake-lock >/dev/null 2>&1 && timeout 8 termux-wake-lock 2>/dev/null || true
  unlock() { command -v termux-wake-unlock >/dev/null 2>&1 && timeout 8 termux-wake-unlock 2>/dev/null || true; }
- trap unlock EXIT INT TERM
+ trap unlock EXIT
+ trap 'exit 130' INT
+ trap 'exit 143' TERM
 # ③ 电池桥: 把 termux-battery-status 快照写入 /tmp(已绑定到 proot 的 /tmp), proot 内读 /tmp/battery.json
 # 同样套 timeout: 该命令走 Termux:API socket, 无响应会挂死
 BATT=/data/data/com.termux/files/usr/tmp/battery.json
@@ -118,6 +120,8 @@ export THOME=/root                                                  #登录用�
 ##删除下行注释，可以将手机目录进行映射，这里将/sdcard映射到/mnt/sdcard，termux目录映射到/etc/termux
 export MayB='-b /sdcard:/root/手机内部存储 -b /data/data/com.termux/files/home:/root/Termux目录'
 
+
+
 # ④ Termux:X11 服务端(:2) —— 已移到脚本【最前面】, 见文件开头。
 #   原因: 放在这里(紧挨 proot 启动)会导致 X server 刚起就进容器, 来不及建 socket,
 #   每次都要手动去点 app。iPupil / phoenixbyrd 两份参考脚本都是"termux-x11 最先起、
@@ -137,6 +141,29 @@ else
   [ "${SYSVIPC:-1}" = 1 ] && echo "注意: 当前 proot 不支持 --sysvipc, MIT-SHM 仍不可用(不影响启动)"
 fi
 
+# ⑥ Codex 沙箱(bwrap)两处修复 —— 2026-10-12 诊断, 详见
+#    /root/工具箱/wip/codex-sandbox-fix-20261011/账本.md
+#   (a) Codex 的 app-server socket 目录硬编码为 /tmp/codex-daemon-$UID (源码
+#       uds/src/daemon_directory.rs:15, 注释明写不受 TMPDIR/CODEX_HOME 影响),
+#       socket 文件名是 64 位 sha256 hex。容器内 /tmp 的宿主前缀 35 字节, 于是宿主
+#       socket 全路径 = 35+15+1+64 = 116 字节, 超过 unix sun_path 的 108 上限。
+#       PRoot 为缩短路径会在 socket 目录【内部】合成一条 bind, 命中 Codex
+#       linux-sandbox/src/daemon_mounts.rs:183 的 nested-mount 判定 => 沙箱组装直接失败
+#       ("error building bubblewrap command: ... unsupported host mount at ...")。
+#       修法: 单独把该目录绑到一条短宿主路径, 让宿主 socket 全路径 = 37+1+64 = 102 字节
+#       (<=107), PRoot 就不再合成嵌套 bind。实测阈值: 宿主 104 字节干净 / 110+ 必触发。
+#       PRoot 的 bind 按最长前缀优先(已用 /dev/shm 嵌在 -b /dev 内实测验证), 故这条
+#       会盖过上面的 .../usr/tmp:/tmp。
+#   (b) Android SELinux 禁止容器读 /proc/sys/kernel/*, 而 bwrap 启动时必读
+#       overflowuid/overflowgid, 否则直接 "Can't read ...: Permission denied" 退出
+#       (系统 bwrap 0.9.0 与 Codex 自带 bwrap 都一样)。补两个只读假文件即可,
+#       内容 65534 就是 Linux 标准 overflow uid/gid。user namespace 本身可用
+#       (unshare -r 成功), 只缺这两个 sysctl。
+#   ★ 这两条都只能在容器【外】的绑定表里修; 容器内无解(路径硬编码 + socket 目录
+#     不接受符号链接 + landlock 后端被该版本 panic 挡死)。
+mkdir -p /data/data/com.termux/files/home/.cdx 2>/dev/null
+chmod 700 /data/data/com.termux/files/home/.cdx 2>/dev/null
+
 command="
 proot \
     --kill-on-exit \
@@ -151,6 +178,9 @@ proot \
     -b $RFSML/root/.config/relay/fake_gid_map:/proc/self/gid_map \
     -b $RFSML/root/.local/share/fakebat:/sys/class/power_supply \
     -b /data/data/com.termux/files/usr/tmp:/tmp \
+    -b /data/data/com.termux/files/home/.cdx:/tmp/codex-daemon-0 \
+    -b $RFSML/root/.config/relay/fake_overflowuid:/proc/sys/kernel/overflowuid \
+    -b $RFSML/root/.config/relay/fake_overflowgid:/proc/sys/kernel/overflowgid \
     -b /data/data/com.termux/files/home/.config/gpt_claude_ai:/root/.config/gpt_claude_ai \
     -b $RFSML$THOME:/dev/shm \
 $MayB
@@ -168,5 +198,4 @@ $MayB
 info
 if [ -z "$*" ]; then $command; else $command -c "$*"; fi
 exit $?
-
 

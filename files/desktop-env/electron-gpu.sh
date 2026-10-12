@@ -16,7 +16,8 @@
 #   exec "$BIN" $ELECTRON_GPU_FLAGS "$@"
 #
 # 逃生开关:
-#   ELECTRON_GPU=off   → 完全不加 GPU 参数(回到纯软件, 出问题时用)
+#   GPU_OFF=1 / LIBGL_ALWAYS_SOFTWARE=1 → 禁用GPU，保留CPU软件绘制；优先于硬件档
+#   ELECTRON_GPU=off   → 禁用GPU及软件GL光栅器(原有排障档)
 #   ELECTRON_GPU=safe  → 默认: 伪造 PCI + 走默认 egl-angle(实测能吃到 kgsl)
 #   ELECTRON_GPU=full  → safe 再加激进参数(光栅化/零拷贝等)
 #   ELECTRON_FAKEPCI=0 → 单独关掉 PCI 伪造(排障用; 关掉后必然回到软件光栅)
@@ -27,16 +28,32 @@
 #   --disable-dev-shm-usage 本环境 /dev/shm 被 start.sh 绑成了 /root
 _EL_BASE="--no-sandbox --disable-dev-shm-usage --disable-gpu-sandbox"
 
+# 显式软件请求优先，不让显示默认值或硬件档重新打开GPU。
+_EL_SOFTWARE=0
+case "${LIBGL_ALWAYS_SOFTWARE:-0}" in
+  1|true|TRUE|yes|YES|on|ON) _EL_SOFTWARE=1 ;;
+esac
+case "${MESA_LOADER_DRIVER_OVERRIDE:-}:${GALLIUM_DRIVER:-}" in
+  swrast:*|llvmpipe:*|softpipe:*|*:llvmpipe|*:softpipe) _EL_SOFTWARE=1 ;;
+esac
+[ "${GPU_OFF:-0}" = 1 ] && _EL_SOFTWARE=1
+case "${ELECTRON_GPU:-}" in off|software) _EL_SOFTWARE=1 ;; esac
+for _el_arg in "$@"; do
+  [ "$_el_arg" = -- ] && break
+  [ "$_el_arg" = --disable-gpu ] && _EL_SOFTWARE=1
+done
+unset _el_arg
+
 # ── 按 display 分流: :1(TigerVNC+DRI3补丁) 与 :2(Termux:X11) 的呈现路径不同 ──
 _d="${DISPLAY:-:1}"
 case "$_d" in
-  :1*)
+  :1|:1.*)
     # VNC 侧: Xtigervnc-dri3 走 lorie DRI3-over-mmap。
     # ★实测: zink 在 :1 上会 CreateSwapchainKHR 失败(VK_ERROR_INITIALIZATION_FAILED),
     #   所以这里和其它应用一样必须走 kgsl 原生, 不能让它落到 zink。
     _EL_DISP_ENV="MESA_LOADER_DRIVER_OVERRIDE=kgsl EGL_PLATFORM=x11 LIBGL_ALWAYS_SOFTWARE=0"
     ;;
-  :2*)
+  :2|:2.*)
     # Termux:X11 侧: 原生 DRI3 + Present, 还有 AHardwareBuffer 零拷贝通道, 天花板更高。
     _EL_DISP_ENV="MESA_LOADER_DRIVER_OVERRIDE=kgsl EGL_PLATFORM=x11 LIBGL_ALWAYS_SOFTWARE=0"
     ;;
@@ -53,7 +70,22 @@ esac
 #   只劫持这一个路径, 其余原样透传。
 #   ★LD_PRELOAD 用【追加】不用覆盖 —— VLC 等应用也在用 LD_PRELOAD shim, 别互相顶掉。
 _EL_SHIM=/root/.local/lib/electron-shim
-if [ "${ELECTRON_FAKEPCI:-1}" = 1 ] && [ -f "$_EL_SHIM/fakepci.so" ] && [ -f "$_EL_SHIM/fake-pci-devices" ]; then
+if [ "$_EL_SOFTWARE" = 1 ]; then
+  # 重复source时仅移除本策略的fakepci，保留调用方的其它preload。
+  _el_preloads=(); _el_kept=()
+  IFS=': ' read -r -a _el_preloads <<< "${LD_PRELOAD:-}"
+  for _el_lib in "${_el_preloads[@]}"; do
+    [ "$_el_lib" = "$_EL_SHIM/fakepci.so" ] || _el_kept+=("$_el_lib")
+  done
+  if [ "${#_el_kept[@]}" -gt 0 ]; then
+    printf -v LD_PRELOAD '%s:' "${_el_kept[@]}"
+    export LD_PRELOAD="${LD_PRELOAD%:}"
+  else
+    unset LD_PRELOAD
+  fi
+  [ "${FAKE_PCI_FILE:-}" = "$_EL_SHIM/fake-pci-devices" ] && unset FAKE_PCI_FILE
+  unset _el_preloads _el_kept _el_lib
+elif [ "${ELECTRON_FAKEPCI:-1}" = 1 ] && [ -f "$_EL_SHIM/fakepci.so" ] && [ -f "$_EL_SHIM/fake-pci-devices" ]; then
   case ":${LD_PRELOAD:-}:" in
     *":$_EL_SHIM/fakepci.so:"*) : ;;                      # 已挂: 幂等
     *) export LD_PRELOAD="$_EL_SHIM/fakepci.so${LD_PRELOAD:+:$LD_PRELOAD}" ;;
@@ -69,13 +101,13 @@ fi
 #                 (否则 GPU 进程静默 exit 1, 连日志都不打)。
 #   ★调用方(包装脚本)需在 source 本文件【之前】定义 BIN 或 ELECTRON_BIN 指向真实可执行文件;
 #     拿不到就退回保守档, 绝不让应用起不来。
-#   ★缓存: 二进制动辄 200MB, 每次启动 strings 一遍会明显拖慢; 按 路径|size|mtime 做 key 缓存,
+#   ★缓存: 二进制动辄 200MB, 每次启动 strings 一遍会明显拖慢; 按 路径|device|inode|size|纳秒mtime|纳秒ctime 做 key 缓存,
 #     二进制一换(升级/替换)key 自然失效, 无需手动清。
 _EL_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/electron-gpu"
 _el_chrome_major() {   # $1=可执行文件 → 打印 major; 拿不到就打印空
   [ -n "${1:-}" ] && [ -r "$1" ] || return 0
   local st key f v
-  st=$(stat -c '%s|%Y' "$1" 2>/dev/null) || return 0
+  st=$(stat -Lc '%d|%i|%s|%y|%z' "$1" 2>/dev/null) || return 0
   key=$(printf '%s|%s' "$1" "$st" | md5sum 2>/dev/null | cut -d' ' -f1)
   [ -n "$key" ] || return 0
   f="$_EL_CACHE/$key"
@@ -95,7 +127,12 @@ else
 fi
 
 # ── GPU 参数分级 ──
-case "${ELECTRON_GPU:-$_EL_AUTO}" in
+_EL_MODE="${ELECTRON_GPU:-$_EL_AUTO}"
+if [ "$_EL_SOFTWARE" = 1 ] && [ "$_EL_MODE" != off ]; then _EL_MODE=software; fi
+case "$_EL_MODE" in
+  software)
+    ELECTRON_GPU_FLAGS="$_EL_BASE --disable-gpu"
+    ;;
   off)
     ELECTRON_GPU_FLAGS="$_EL_BASE --disable-gpu --disable-software-rasterizer"
     ;;
@@ -135,9 +172,36 @@ esac
 
 # 把 display 相关的 Mesa 变量导出(对 Electron 自身影响有限, 但它内部起的
 # 辅助进程/子进程若走 GL 仍会读到; 且与 gpu.sh 保持口径一致便于排障)
-if [ -n "$_EL_DISP_ENV" ]; then
-  for _kv in $_EL_DISP_ENV; do export "${_kv?}"; done
+if [ "$_EL_SOFTWARE" = 1 ]; then
+  export LIBGL_ALWAYS_SOFTWARE=1
+  case "${MESA_LOADER_DRIVER_OVERRIDE:-}" in kgsl|zink) unset MESA_LOADER_DRIVER_OVERRIDE ;; esac
+  case "${GALLIUM_DRIVER:-}" in kgsl|zink) unset GALLIUM_DRIVER ;; esac
+elif [ -n "$_EL_DISP_ENV" ]; then
+  # 这些是当前应用/显示的默认值；不覆盖调用方明确指定的驱动或平台。
+  for _kv in $_EL_DISP_ENV; do
+    _el_name="${_kv%%=*}"
+    [ -v "$_el_name" ] || export "${_kv?}"
+  done
 fi
-unset _d _kv _EL_DISP_ENV
+unset _d _kv _el_name _EL_DISP_ENV _EL_SOFTWARE _EL_MODE
+
+# ── ★字体等比例放大(2026-09-28, 用户级; 所有走本文件的 Electron 应用统一生效) ──
+#   Electron/Chromium【不认】系统字体 DPI(XFCE 的 Sans 24 / Xft.DPI 只对 GTK/Qt 生效),
+#   只能用这个命令行开关在渲染层等比放大整个 UI(含字体)。放这里 = 落雪/星火/Bilibili 及
+#   以后任何经 electron-wrap 或本 GPU 文件的 Electron 应用【一处统一放大】(方案3)。
+#   默认每次启动按当前工作区计算（用户级 adaptive-ui/electron profile），兼顾横竖屏。
+#   显式 ELECTRON_SCALE 始终优先；UI_FIT_DISABLE=1 恢复旧默认1.5。
+#   仅局部变量承接结果，不 export 自动结果，避免子应用继承过时的屏幕比例。
+_EL_SCALE="${ELECTRON_SCALE:-}"
+if [ -z "$_EL_SCALE" ] && [ "${UI_FIT_DISABLE:-0}" != 1 ] && [ -x /root/.local/bin/ui-fit ] &&
+   /root/.local/bin/ui-fit is-enabled --app electron --target "${ELECTRON_BIN:-${BIN:-}}"; then
+  _EL_SCALE=$(/root/.local/bin/ui-fit --app electron --profile electron --factor 2>/dev/null) || _EL_SCALE=""
+fi
+_EL_SCALE="${_EL_SCALE:-1.5}"
+case "$_EL_SCALE" in
+  1|1.0|"") : ;;
+  *) ELECTRON_GPU_FLAGS="$ELECTRON_GPU_FLAGS --force-device-scale-factor=$_EL_SCALE" ;;
+esac
+unset _EL_SCALE
 
 export ELECTRON_GPU_FLAGS

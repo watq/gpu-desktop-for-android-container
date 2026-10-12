@@ -22,6 +22,12 @@
 #   · 窗口判定: :1 有窗管用 wmctrl; :2 可能没窗管 → 回退 xwininfo 扫根窗口子窗口。
 #   · GPU 判定: 读 /proc/<pid>/fd 找 kgsl-3d0 —— 这是唯一可靠证据, 比 glxinfo 更硬。
 #   · 结果同时写 /tmp/regression/ 下, 方便事后翻。
+#   · ★2026-09-26 起挂 measure-lib.sh(账本铁律 32-36): 开跑前先做三件事 ——
+#       ① 摆出两个 display 的像素倍数差(:1 是 :2 的 2.2 倍, 跨端比数字必须按像素归一)
+#       ② 查长驻服务 stdin 有没有被接到普通文件(epoll 会 EPERM, 表现是"起来了但不动")
+#       ③ 打印判据自检清单(判据必须能区分"功能不存在"与"工具表达不了这个测试")
+#     性能类测量请直接用库里的 m_compute_sample / m_validate_* / m_interleave / m_median,
+#     不要自己手写"跑 N 次取平均" —— 均值会被一次降频尖峰拽走, 且没有验证器就发现不了机器在动。
 # ════════════════════════════════════════════════════════════════════════════
 set -u
 OUT=/tmp/regression
@@ -48,6 +54,20 @@ xfce4-appfinder|xfce4-appfinder|n
 "
 
 c_ok=$'\033[32m'; c_bad=$'\033[31m'; c_warn=$'\033[33m'; c_off=$'\033[0m'
+# ── 测量纪律(账本铁律 32-36) ──
+# 库不在也要能跑测试, 所以是软依赖: 有就用, 没有就只提醒一句。
+M_LIB=/root/工具箱/sh/measure-lib.sh
+if [ -r "$M_LIB" ]; then . "$M_LIB"; M_LIB_OK=1; else M_LIB_OK=0; fi
+
+preflight() {
+  [ "$M_LIB_OK" = 1 ] || { echo "  (measure-lib.sh 不在, 跳过测量纪律前置检查)"; return 0; }
+  echo "── 测量纪律前置检查 ──"
+  m_geom_warn :1 :2 2>/dev/null
+  m_check_stdin_sanity
+  m_self_check_hint
+  echo
+}
+
 ok(){ printf '%s%s%s' "$c_ok" "$1" "$c_off"; }
 bad(){ printf '%s%s%s' "$c_bad" "$1" "$c_off"; }
 warn(){ printf '%s%s%s' "$c_warn" "$1" "$c_off"; }
@@ -135,13 +155,28 @@ STATIC_ONLY=0
 [ "${1:-}" = "--static" ] && { STATIC_ONLY=1; shift; }
 DISPLAYS="${1:-:1 :2}"
 ONLY_APP="${2:-}"
-[ "$DISPLAYS" = ":1" ] || [ "$DISPLAYS" = ":2" ] || DISPLAYS=":1 :2"
+# ★2026-10-03 修: 原来是
+#     [ "$DISPLAYS" = ":1" ] || [ "$DISPLAYS" = ":2" ] || DISPLAYS=":1 :2"
+#   —— 只认 :1/:2 两个字面量, 传任何别的(例如 :3 测试台)都会被【静默改回 ":1 :2"】,
+#   等于在用户正在办公的显示上逐个拉起应用。静默回退成"打扰用户"是最坏的默认值。
+#   现在: 任何 :N 都照传; 形状不对就直接报错退出, 绝不猜。
+for _d in $DISPLAYS; do
+  case "$_d" in
+    :[0-9]|:[0-9][0-9]) ;;
+    *) printf '✘ display 参数 "%s" 形状不对(应形如 :1 / :3)。\n' "$_d" >&2
+       printf '  用法: %s [--static] [:N ...] [app]\n' "$(basename "$0")" >&2
+       exit 2 ;;
+  esac
+done
+unset _d
 
 echo "════════════════════════════════════════════════════════════════════════"
 echo " 应用回归测试   显示=[$DISPLAYS]   每app等待=${WAIT}s   $(date '+%m-%d %H:%M')"
 echo "════════════════════════════════════════════════════════════════════════"
 
 printf '\n【静态检查】汉化 与 防更新覆盖\n'
+preflight
+
 printf '  %-16s %-10s %-10s %-22s %s\n' 应用 中文名 翻译文件 防更新覆盖 期望GPU
 printf '  %s\n' "────────────────────────────────────────────────────────────────────"
 echo "$APPS" | grep -v '^$' | while IFS='|' read -r app cmd wantgpu; do

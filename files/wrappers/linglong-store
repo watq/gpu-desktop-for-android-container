@@ -1,8 +1,12 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════
-# linglong-store 启动 shim (2026-09-24 修订, 用户级防更新覆盖)
-#   /usr/local/bin 在 PATH 里优先于 /usr/bin, 且不被 dpkg 更新覆盖。
-#   配合 ~/.local/share/applications/ 下两个同名 .desktop override(Exec 写绝对路径),
+# linglong-store 启动 shim【本体】(2026-09-24 起; 2026-09-28 迁 .local + 加字体放大)
+#   落点: /root/.local/lib/linglong-shim/  (用户级, 在 $HOME 内; dpkg 管不到, 升级冲不掉)
+#   /root/.local/bin/linglong-store 是指向本文件的软链(PATH 最前);
+#   /usr/local/bin/linglong-store 也是指向本文件的软链(兜底)。
+#   ★2026-09-28: 原来是 /usr/local/bin 里的真文件(系统级), 现改成 .local/lib 本体 + 软链,
+#     与 spark-store 同构, 才算真正的"用户级"。同目录已有 no_impeller.so / dbus-login1-stub.so。
+#   配合 ~/.local/share/applications/ 下两个同名 .desktop override(Exec 指 .local/bin),
 #   可一次覆盖全部入口: 主菜单图标、og:// 协议唤起、终端直接跑。
 #
 # ★ 它【不是 Electron】, 是 Flutter Linux GTK 应用(lib/libflutter_linux_gtk.so + libapp.so
@@ -62,9 +66,41 @@ if [ -z "${LINGLONG_STORE_KEEP_DRIVER:-}" ]; then
 fi
 
 # 坎 3 (设 LINGLONG_STORE_KEEP_IMPELLER=1 可跳过, 方便排查)
-SHIM_SO=/usr/local/lib/linglong-store/no_impeller.so
+#   本体优先用 .local 里的(用户级), 找不到再回退 /usr/local/lib(旧位置, 兜底)。
+SHIM_SO=/root/.local/lib/linglong-shim/no_impeller.so
+[ -f "$SHIM_SO" ] || SHIM_SO=/usr/local/lib/linglong-store/no_impeller.so
 if [ -z "${LINGLONG_STORE_KEEP_IMPELLER:-}" ] && [ -f "$SHIM_SO" ]; then
   export LD_PRELOAD="${SHIM_SO}${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
+# ── 字体放大(2026-09-28, 用户级防更新覆盖) ──
+#   玲珑=Flutter。Flutter Linux 嵌入层回退到 FlGnomeSettings 时会读 GSettings 键
+#     org.gnome.desktop.interface text-scaling-factor 并作为 textScaleFactor 应用到全部文字
+#     (已用 strings 在 libflutter_linux_gtk.so 里证实它链了这个 schema)。
+#   用【per-app dconf profile】只给本应用把该键覆盖成放大值, 不污染全局(其它应用照常 1.0);
+#   本体全在 .local/lib/linglong-shim/dconf/(用户级, 会被 backup 收)。
+#   调节: LINGLONG_FONT_SCALE=1.5 linglong-store ; 要原始大小设 LINGLONG_FONT_SCALE=1.0
+LL_SHIM=/root/.local/lib/linglong-shim/dconf
+LL_SCALE="${LINGLONG_FONT_SCALE:-1.3}"
+if command -v dconf >/dev/null 2>&1; then
+  _cur=$(sed -n 's/^text-scaling-factor=//p' "$LL_SHIM/db.d/00-bigfont" 2>/dev/null)
+  if [ ! -f "$LL_SHIM/bigfont.db" ] || [ "$LL_SCALE" != "$_cur" ]; then
+    mkdir -p "$LL_SHIM/db.d" 2>/dev/null
+    printf '[org/gnome/desktop/interface]\ntext-scaling-factor=%s\n' "$LL_SCALE" > "$LL_SHIM/db.d/00-bigfont" 2>/dev/null
+    printf 'user-db:user\nfile-db:%s/bigfont.db\n' "$LL_SHIM" > "$LL_SHIM/profile" 2>/dev/null
+    dconf compile "$LL_SHIM/bigfont.db" "$LL_SHIM/db.d" 2>/dev/null || true
+  fi
+  [ -f "$LL_SHIM/bigfont.db" ] && [ "$LL_SCALE" != 1.0 ] && [ "$LL_SCALE" != 1 ] && export DCONF_PROFILE="$LL_SHIM/profile"
+fi
+
+# 本机会话 portal 缺 Settings 接口，Flutter 却不自行回退，导致上述 profile 无效。
+# 只让本进程中 Flutter 创建的 Settings 代理回退；其他 DBus/GTK 代理照常透传。
+# 2026-10-03 独立显示验证：同页文字放大，普通 DBus 与非 Flutter Settings 代理可用。
+# 逃生：LINGLONG_FONT_SETTINGS_FALLBACK=0 保留旧行为；不修改会话总线地址。
+LL_FONT_SETTINGS=/root/.local/lib/linglong-shim/font_settings.so
+if [ "${LINGLONG_FONT_SETTINGS_FALLBACK:-1}" != 0 ] && [ -r "$LL_FONT_SETTINGS" ]; then
+  export LINGLONG_FONT_SETTINGS_FALLBACK=1
+  export LD_PRELOAD="${LL_FONT_SETTINGS}${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
 exec "$BIN" "$@"

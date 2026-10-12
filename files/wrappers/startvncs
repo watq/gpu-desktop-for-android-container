@@ -124,9 +124,24 @@ else
 fi
 
 # ── 起 Xvnc ──
-echo "[i] $(basename "$XVNC")  $DISP  ${VNC_GEOM}  dpi=${VNC_DPI}  port=${PORT}"
+# ★2026-10-04 新增 -FrameRate(子代理 vncperf 实测) ──────────────────────────────
+#   -FrameRate = 【每个客户端每秒最多收到多少次 FramebufferUpdate】, TigerVNC 默认 60。
+#   本机手机屏是 120Hz, 所以默认 60 是一道【硬的流畅度天花板】, 不是建议值。
+#   :3 上同配置(1152x2504/depth24/CompareFB 0/同 ZRLE shim)、纯 Xlib 全窗每帧全变负载、
+#   源稳定产出 150fps 时实测(中位, n=2, 交错跑):
+#        档位            客户端编码        送达更新/s   MiB/s   延迟p50   Xvnc%
+#        -FrameRate 60   ZRLE(shim lvl0)     53.43      79.28   16.55ms   42.20
+#        -FrameRate 120  ZRLE(shim lvl0)     66.97      99.37   12.55ms   43.35   ← +25% 帧, CPU 仅 +1.2pp
+#        -FrameRate 60   Tight q6            54.41       7.24   15.90ms   36.80
+#        -FrameRate 120  Tight q6           103.66      13.74    8.90ms   55.20   ← +90% 帧
+#   ⇒ 60 这个上限【确实在限】(源有 150fps 可送而只送出 53)。抬到 120 服务端侧确有提升。
+#   ★但【默认仍保持 60】: 手机 App 侧的解码/显示能不能吃下多出来的帧与字节【尚未实测】,
+#     在没有手机端验收前不改用户正在用的行为(承项目纪律"不以诊断修复冒充性能修复")。
+#   试 120:  VNC_FRAMERATE=120 startvncs     (需要 stopvnc 后重起才生效)
+#   回滚  :  不改文件, VNC_FRAMERATE=60 startvncs  即恢复(或直接删掉下面那一行)
+echo "[i] $(basename "$XVNC")  $DISP  ${VNC_GEOM}  dpi=${VNC_DPI}  port=${PORT}  fps上限=${VNC_FRAMERATE:-60}"
 LD_PRELOAD=/lib/aarch64-linux-gnu/libgcc_s.so.1 \
-"$XVNC" "$DISP" \
+/root/.local/lib/vnc-shim/xvnc-local-wrap.sh "$XVNC" "$DISP" \
   -localhost=1 \
   -desktop remote-desktop \
   -rfbport "$PORT" \
@@ -135,6 +150,8 @@ LD_PRELOAD=/lib/aarch64-linux-gnu/libgcc_s.so.1 \
   -auth /root/.Xauthority \
   -geometry "$VNC_GEOM" \
   -depth 24 \
+  -CompareFB 0 \
+  -FrameRate "${VNC_FRAMERATE:-60}" \
   -dpi "$VNC_DPI" \
   >"$LOG" 2>&1 &
 XVNC_PID=$!

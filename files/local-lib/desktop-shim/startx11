@@ -25,6 +25,7 @@
 # 用法:  startx11           正常启动(kgsl 硬件 GL)
 #        startx11 --soft    回落软件渲染(kgsl 崩时用)
 #        startx11 --check    只检查环境不起桌面
+#        startx11 --wm      【只补窗口管理器】: 不动会话/不重起桌面, 只保证 :2 上有 xfwm4
 #        stopx11            停止容器内桌面
 # ════════════════════════════════════════════════════════════════
 set -u
@@ -47,6 +48,7 @@ case "${1:-}" in
   --gpu|--hw) MODE=normal ;;
   --soft)  MODE=soft ;;
   --check) MODE=check ;;
+  --wm|--wm-only) MODE=wm ;;
   -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
   "") ;;
   *) echo "未知参数: $1 (可用 --gpu / --soft / --check)"; exit 1 ;;
@@ -89,7 +91,10 @@ mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null
 # ── ② 环境: 复用 desktop-env(改一处即可), 与 startvncs 同款做法 ──
 [ -r /root/.config/desktop-env/apps.sh ] && . /root/.config/desktop-env/apps.sh
 # 中文输入法(ibus+libpinyin); 变量必须在起桌面【前】设好, 否则已启动的 GUI 收不到
-if [ -r /root/.config/desktop-env/im.sh ]; then . /root/.config/desktop-env/im.sh; im_start; fi
+# ★--wm(只补窗口管理器)时跳过 im_start: 那是"桌面已经在跑、只是 WM 掉了"的修补路径,
+#   再拉一遍 ibus 是多余副作用(输入法早就在跑了)。
+# im_start 仅在新建总线后的子会话内调用；--check 只加载变量。
+if [ "$MODE" != wm ] && [ -r /root/.config/desktop-env/im.sh ]; then . /root/.config/desktop-env/im.sh; fi
 if [ -r /root/.config/desktop-env/gpu.sh ]; then
   . /root/.config/desktop-env/gpu.sh          # VK_ICD / present=mailbox / vblank
 fi
@@ -111,7 +116,7 @@ fi
 #   2026-09-22 实测: "MESA-LOADER: failed to retrieve device information" 是**非致命噪音**,
 #   打完这行照样成功加载 kgsl 并直出 Adreno (TM) 830v1 / Accelerated: yes。
 #   早期版本把它当失败是误判, 已修正。
-if command -v glxinfo >/dev/null 2>&1; then
+if [ "$MODE" != wm ] && command -v glxinfo >/dev/null 2>&1; then
   GLXOUT=$(glxinfo -B 2>/dev/null)
   R=$(printf '%s' "$GLXOUT" | grep -i 'OpenGL renderer string' | cut -d: -f2- | sed 's/^ *//')
   A=$(printf '%s' "$GLXOUT" | grep -i 'Accelerated' | cut -d: -f2- | sed 's/^ *//')
@@ -126,11 +131,121 @@ if command -v glxinfo >/dev/null 2>&1; then
     *zink*)
       echo "[✔] 硬件加速正常 (经 Zink→Turnip; 想直出把 MESA_LOADER_DRIVER_OVERRIDE=kgsl 设上)" ;;
   esac
+elif [ "$MODE" = wm ]; then
+  :   # --wm 只补 WM, 渲染器自检无关, 不打印(否则会误报"未装 glxinfo")
 else
   echo "[i] 未装 glxinfo, 跳过渲染器自检 (apt install mesa-utils)"
 fi
 
+# ── ③′ 剥离【从别的 display 的会话继承来的】会话环境 (2026-09-27 加, 本次根因) ──
+# ★2026-09-27 实测根因(用户报"startx11 起不了 :2 桌面"):
+#   用户从 :1 桌面上的终端(xfce4-terminal 等)里跑 startx11 时, 这个 shell 继承了 :1 那套
+#   xfce 会话的 SESSION_MANAGER=local/localhost:@/tmp/.ICE-unix/<:1的xfce4-session pid>。
+#   而 xfce4-session 的第一道门就是【SESSION_MANAGER 非空 → 直接拒起】:
+#     (xfce4-session:16625): xfce4-session-WARNING **: Another session manager is already running
+#   它 0.3 秒就退了, 但 dbus-launch / dbus-daemon / at-spi-bus-launcher / at-spi2-registryd
+#   已经起来并变成 PPid=1 的孤儿 → 现象就是 ":2 上 X server 活着(socket 在、xdpyinfo 通、
+#   分辨率也对), 却一个 xfce 组件都没有, 根窗连 _NET_SUPPORTING_WM_CHECK 都没有"。
+#   实测铁证: /tmp/xfce-x11.log(19:38 那次全文只两行) + tr '\0' '\n' </proc/16629/environ
+#   里那条指向 :1 的 SESSION_MANAGER。※ 同一份脚本从【不带 SESSION_MANAGER 的 shell】跑
+#   一次就通(退出码 0, 四件套全起) —— 所以这【不是】0926 那几处改动(wm_present/ensure_wm、
+#   cursor-watch、clean_stale_x2 改 exe 匹配)的回归, 它们全都无罪。
+# ★DBUS_SESSION_BUS_ADDRESS 一起剥, 两个理由(都实测过):
+#   ① dbus-launch 万一不在会回落裸 startxfce4, 那时 :1 的 session bus 会泄漏给 :2 的组件
+#      → 两个 display 共用一个 xfconfd → 设置脑裂(MEMORY: D-Bus 会话总线那条);
+#   ② cursor-sync.sh / cursor-watch.sh 的设计是"本 shell 没有 bus 地址时, 按 display 从该
+#      display 上 xfsettingsd 的 environ 里捞正确的那条"。留着 :1 的地址会让它们把 :2 的
+#      光标设置写到 :1 的总线上 —— 剥掉反而走对路径。
+# ★ICEAUTHORITY 同属 SESSION_MANAGER 那一套(ICE 授权), 留着会让新会话去读 :1 的 ICE 授权。
+# ※ 放在 --check 之前, 这样 `startx11 --check` 也能提前把这个环境问题报出来。
+if [ -n "${SESSION_MANAGER:-}" ]; then
+  echo "[i] 已剥离继承来的 SESSION_MANAGER=$SESSION_MANAGER"
+  echo "    (它指向【别的 display】的会话管理器; 留着 xfce4-session 会报 'Another session manager"
+  echo "     is already running' 秒退 → :2 上只剩孤儿 dbus/at-spi, 桌面起不来)"
+  unset SESSION_MANAGER
+fi
+if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+  echo "[i] 已剥离继承来的 DBUS_SESSION_BUS_ADDRESS (防 :2 组件挂到 :1 的总线 → 共用 xfconfd 设置脑裂)"
+  unset DBUS_SESSION_BUS_ADDRESS
+fi
+unset DBUS_SESSION_BUS_PID DBUS_SESSION_BUS_WINDOWID
+if [ -n "${ICEAUTHORITY:-}" ]; then
+  echo "[i] 已剥离继承来的 ICEAUTHORITY (与 SESSION_MANAGER 同一套 ICE 授权)"
+  unset ICEAUTHORITY
+fi
+
 [ "$MODE" = check ] && { echo "[i] --check: 只检查, 不起桌面"; exit 0; }
+
+# ── ④′ 窗口管理器存活自愈 (2026-09-26 加, E-DA) ────────────────
+# ★为什么必须有这个:
+#   Termux:X11 的 X server 活在【宿主 Android App】里, 容器重启它不跟着死。
+#   所以 /tmp/.X11-unix/X2 照样在、DISPLAY=:2 xdpyinfo 照样返回分辨率(当时 1280x1024, 现 2504x1156) ——
+#   "能连上 :2" 完全不代表 ":2 上有桌面"。2026-09-26 实测: 容器 19:37:58 重启后只拉了 :1
+#   那条链, :2 上 xfce4-session/xfwm4/xfce4-panel 全是 0, 但 :2 依然"连得上"。
+#   没有 WM 的后果不只是没标题栏/不能拖动: 【最大化变成空操作】→ 窗口按请求的宽度挂在
+#   屏幕外 → 截图/录屏工具抓不到帧 → 测出来全 0, 看起来像"已修好"。这会污染所有在 :2
+#   上做的测量(已实证坑过一次), 所以宁可多起一个 xfwm4, 不能让 :2 裸奔。
+#
+# ★判据用 _NET_SUPPORTING_WM_CHECK 根窗属性, 不用 cmdline 文本匹配(铁律35):
+#   文本匹配会把"命令行里恰好出现 xfwm4 的 shell"(包括本脚本自己)误判成 WM 在跑。
+#   有 WM 的定义就是 EWMH 里这个属性存在 —— 这是 wmctrl/xdotool/GTK 全都认的那个判据。
+# ★★但【光看 root 上那条属性不够】(2026-09-26 实测): xfwm4 被 kill 之后, root 上的
+#   _NET_SUPPORTING_WM_CHECK 会留成【野指针】—— 属性还在、还指着 0x600032, 但那个窗口
+#   早没了。只查 root 会得出"已有 WM"的假阳性, 而 wmctrl -m 此时报
+#   "X Error ... BadWindow ... Resource id 0x600032"。
+#   EWMH 规定必须【回查子窗口】: 那个窗口上要有同名属性指回自己。实测对比:
+#     野指针 → xprop -id <id> _NET_SUPPORTING_WM_CHECK 只吐一个裸原子名, 无 "window id"
+#     活 WM  → _NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x200032, 且 _NET_WM_NAME="Xfwm4"
+#   所以判据 = root 有 id 且回查子窗口仍能读到 "window id"。
+wm_present() {   # $1=display; 返回0=真有活的WM
+  local d="$1" id
+  id=$(DISPLAY="$d" xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null \
+        | sed -n 's/.*window id # \(0x[0-9a-fA-F]*\).*/\1/p' | head -1)
+  [ -n "$id" ] || return 1
+  DISPLAY="$d" xprop -id "$id" _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' || return 1
+  return 0
+}
+
+wm_name() {   # $1=display; 打印 WM 名(取 EWMH 的 _NET_WM_NAME, 不依赖 wmctrl 是否装)
+  local d="$1" id
+  id=$(DISPLAY="$d" xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null \
+        | sed -n 's/.*window id # \(0x[0-9a-fA-F]*\).*/\1/p' | head -1)
+  [ -n "$id" ] && DISPLAY="$d" xprop -id "$id" _NET_WM_NAME 2>/dev/null \
+    | sed -n 's/.*= "\(.*\)"$/\1/p' | head -1
+}
+
+ensure_wm() {   # $1=display
+  local d="$1" p e dp
+  if wm_present "$d"; then
+    echo "[OK] $d 已有窗口管理器 ($(wm_name "$d"))"
+    return 0
+  fi
+  command -v xfwm4 >/dev/null 2>&1 || { echo "[!] $d 没有 WM, 且本机没装 xfwm4 —— 跳过"; return 1; }
+  echo "[…] $d 上没有活的窗口管理器, 正在补起 xfwm4…"
+  # ★ 9>&- <&- 必须有: 调用方可能持着 flock 的 fd 9, 后台常驻进程会【继承】它,
+  #   xfwm4 就成了那把锁的永久持有者, 后续所有 flock 等待全部超时卡死(2026-09-26 实测踩过)。
+  ( DISPLAY="$d" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-root}" \
+    setsid xfwm4 >>"${WMLOG:-/tmp/xfwm4-$(echo "$d" | tr -d ':').log}" 2>&1 9>&- <&- & ) 2>/dev/null
+  sleep 4
+  if wm_present "$d"; then
+    # 打印真实 pid(按 /proc/<pid>/exe + environ 的 DISPLAY 定位, 不按 cmdline 文本)
+    for p in /proc/[0-9]*; do
+      e=$(basename "$(readlink "$p/exe" 2>/dev/null)" 2>/dev/null)
+      [ "$e" = xfwm4 ] || continue
+      dp=$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)
+      [ "$dp" = "$d" ] && echo "[OK] xfwm4 已补起 (pid ${p#/proc/}, DISPLAY=$d) —— 最大化/拖动/标题栏恢复"
+    done
+    return 0
+  fi
+  echo "[✘] xfwm4 补起失败, 看日志 ${WMLOG:-/tmp/xfwm4-$(echo "$d" | tr -d ':').log}"
+  echo "    ※ 注意: 没有 WM 时窗口无法最大化, 在 $d 上做的任何截图/录屏/尺寸测量都不可信。"
+  return 1
+}
+
+# --wm: 只补窗口管理器, 不碰会话(用于"桌面还在但 WM 掉了"或"只想补 WM"的场合)
+if [ "$MODE" = wm ]; then
+  ensure_wm "$DISP"; exit $?
+fi
 
 # ── ④ 起桌面 ────────────────────────────────────────────────
 # ⚠ 判"是否已有会话"必须【按 display 区分】: VNC(:1) 自己也跑着一个 xfce4-session,
@@ -141,11 +256,11 @@ session_on_display() {   # $1=display, 打印命中的 pid
   for d in /proc/[0-9]*; do
     pid=${d#/proc/}
     # 进程可能在 glob 与读取之间退出 → 整段静音, 否则会刷 "没有那个文件或目录"
-    c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
-    case "$c" in
-      xfce4-session*|*/xfce4-session*) ;;
-      *) continue ;;
-    esac
+    # ★按 /proc/<pid>/exe 的真实程序名匹配, 不按 cmdline 文本(2026-09-26 改):
+    #   文本匹配会误杀"命令行里恰好提到这些词"的 shell —— 如 bash -c '...xfsettingsd...'
+    #   带着 DISPLAY=:2 就会被当成桌面组件杀掉(2026-09-25 实测 exit 144)。
+    c=$(basename "$(readlink "$d/exe" 2>/dev/null)" 2>/dev/null)
+    [ "$c" = xfce4-session ] || continue
     dp=$( { tr '\0' '\n' < "$d/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)
     [ "$dp" = "$1" ] && echo "$pid"
   done
@@ -163,30 +278,39 @@ fi
 #   这里在【确认 :2 没有活的 xfce4-session】后, 只清这些孤儿(按 DISPLAY=:2 + 进程名白名单),
 #   绝不碰 :1 / X2 server / adb / relay-watch / fake-upowerd, 也排除本脚本自身进程树。
 clean_stale_x2() {
-  local p pid c dp self=$$ par=$PPID
+  local p pid e c dp self=$$ par=$PPID
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     [ "$pid" = "$self" ] && continue
     [ "$pid" = "$par" ]  && continue
-    c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null ) || continue
-    [ -n "$c" ] || continue
     dp=$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)
     [ "$dp" = "$DISP" ] || continue
-    case "$c" in
-      *dbus-launch*|*dbus-daemon*|*at-spi-bus-launcher*|*at-spi2-registryd*|*xfsettingsd*|*xfconfd*|*xfwm4*|*xfdesktop*|*xfce4-panel*|*panel/wrapper*|*picom*|*Thunar\ --daemon*|*xfce4-clipman*)
+    # ★按 /proc/<pid>/exe 的真实程序名匹配, 不按 cmdline 文本(2026-09-26 改):
+    #   文本匹配会误杀"命令行里恰好提到这些词"的 shell —— 如 bash -c '...xfsettingsd...'
+    #   带着 DISPLAY=:2 就会被当成桌面组件杀掉(2026-09-25 实测 exit 144)。
+    e=$(basename "$(readlink "$p/exe" 2>/dev/null)" 2>/dev/null)
+    case "$e" in
+      dbus-launch|dbus-daemon|at-spi-bus-launcher|at-spi2-registryd|xfsettingsd|xfconfd|xfwm4|xfdesktop|xfce4-panel|wrapper-2.0|picom|xfce4-clipman)
         kill "$pid" 2>/dev/null ;;
+      thunar)   # 只杀 Thunar --daemon, 用户开着的文件管理器窗口不动
+        c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null )
+        case "$c" in *--daemon*) kill "$pid" 2>/dev/null ;; esac ;;
     esac
   done
   sleep 1
 }
 clean_stale_x2
 
-# dbus-launch 对某些用户不工作, 失败则退回裸 startxfce4(官方 README 也提了这点)
-if command -v dbus-launch >/dev/null 2>&1; then
-  dbus-launch --exit-with-session startxfce4 >"$LOG" 2>&1 &
-else
-  startxfce4 >"$LOG" 2>&1 &
-fi
+# 输入法与 XFCE 必须在同一条新会话总线上启动；建总线失败就停止，避免 autolaunch 分叉。
+command -v dbus-launch >/dev/null 2>&1 || { echo "[✘] 缺少 dbus-launch，未启动桌面"; exit 1; }
+dbus-launch --exit-with-session bash -c '
+  [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || exit 1
+  if [ -r /root/.config/desktop-env/im.sh ]; then
+    . /root/.config/desktop-env/im.sh
+    im_start
+  fi
+  exec startxfce4
+' >"$LOG" 2>&1 &
 echo $! > "$PIDF"
 sleep 4
 
@@ -197,23 +321,20 @@ if [ -n "$NEW" ]; then
   echo "  proot内:       $LOG"
   echo "  Termux真实路径: $LOG_TERMUX"
 
-  # ── ⑤ picom 独立合成器 (CFG4) ────────────────────────────────
-  # ★2026-09-22 改为【兜底】: 正常由 /etc/xdg/autostart/picom.desktop → picom-autostart
-  #   (已改成 :2-only 守卫)在 xfce 会话起来时拉起。这里只在【没起来】时补, 避免
-  #   autostart 与本处两个 picom 抢 :2 打架(X error 8 MATCH 的真因)。
-  if [ "$MODE" != soft ] && command -v picom >/dev/null 2>&1; then
-    sleep 2
-    if pgrep -x picom >/dev/null; then
-      echo "[OK] picom 合成器已由 autostart 拉起 (glx/GPU)"
-    else
-      picom --config /root/.config/picom.conf >/tmp/picom-x11.log 2>&1 &
-      sleep 2
-      pgrep -x picom >/dev/null && echo "[OK] picom 合成器已起(兜底, glx/GPU)" \
-        || echo "[!] picom 没起来, 看 /tmp/picom-x11.log; 桌面仍可用(只是无合成会卡)"
-    fi
+  # :2 独立合成器统一走 guard 的 DISPLAY 判重和既有锁，避免多入口竞争。
+  if [ "$MODE" != soft ] && [ -x /root/.local/bin/picom-guard ]; then
+    PICOM_GUARD_DISP="$DISP" /root/.local/bin/picom-guard once \
+      || echo "[!] picom 未就绪，查看 /root/.cache/desktop-env/picom-guard.d2.log"
   else
-    [ "$MODE" = soft ] && echo "[i] --soft 模式: 跳过 picom(软件渲染下合成无意义)"
+    [ "$MODE" = soft ] && echo "[i] --soft 模式: 跳过 picom"
   fi
+
+  # ── ⑤′ 确认窗口管理器真的起来了 (2026-09-26 加, E-DA) ─────────
+  # xfce4-session 正常会自己拉 xfwm4, 但【不保证】: 会话起一半、xfwm4 崩、或 session
+  # 拉起顺序被 :1 那边的 SM 抢掉时, 会出现"桌面在、WM 不在"。这里幂等兜底一次。
+  # 放在 picom 之后: 此时距 xfce4-session 启动已有 ~6s, 正常情况下它自己的 xfwm4 早就在了,
+  # ensure_wm 只会打印一行 [OK] 不会重复起。
+  ensure_wm "$DISP"
 
   # ── ⑥ 电池链路 (给 xfce4 原生 power-manager-plugin 供电量) ──────
   # proot 无 systemd/udev → 手动拉: fakebat同步 → 系统D-Bus → upowerd。
@@ -222,14 +343,53 @@ if [ -n "$NEW" ]; then
     /root/.local/bin/power-stack.sh start 2>&1 | sed 's/^/     /'
   fi
 
-  # 光标同步(2026-09-25): xfsettingsd 只管 XSETTINGS, 不写 Xcursor.* 的 xrdb 资源,
-  # 根窗光标也只在会话启动时定一次 → 不同步的话「设置→鼠标→光标大小」看不出变化。
-  # 该脚本只【读 xfconf】再推给 X 层, xfconf 仍是唯一真源, 不架空原生 GUI 控制。
+  # 光标同步 + 看守(2026-09-25 建 sync, 2026-09-26 补 watch)
+  # cursor-sync.sh : 读 xfconf → 写 xrdb 的 Xcursor.* → xsetroot 重设根窗光标(会话起来后一次)。
+  # cursor-watch.sh: 常驻监听 xfconf 的 /Gtk/CursorTheme*, 用户在「设置→鼠标和触摸板」一改
+  #   就自动再同步一次, 并把值横向推给另一个 display —— 没有它的话, 会话起来之后再改大小
+  #   就没人同步了(这是"改了没反应"的一半原因; 另一半是主题里没有那么大的图, 见 vintage-hidpi)。
+  # 两者都【只读 xfconf】再往 X 层推, xfconf 仍是唯一真源, 不架空原生 GUI 控制。
   [ -x /root/.config/desktop-env/cursor-sync.sh ] && /root/.config/desktop-env/cursor-sync.sh "$DISP"
+  [ -x /root/.config/desktop-env/cursor-watch.sh ] && /root/.config/desktop-env/cursor-watch.sh start "$DISP"
+  # 壁纸/面板双向同步 :1<->:2 (2026-09-28)。守护等两条会话总线就绪、flock 单例、自愈; 幂等, 从两侧各调一次都安全。关闭: XFSYNC=0。
+  # 先自愈 tumbler cache 软链(防系统更新/清理删掉 → 「背景→目录」又空白); 只补软链, 幂等。
+  [ -x /root/.config/desktop-env/ensure-tumbler-link.sh ] && /root/.config/desktop-env/ensure-tumbler-link.sh >/dev/null 2>&1
+  [ -x /root/.config/desktop-env/xfsync-watch.sh ] && \
+    ( sleep 12; /root/.config/desktop-env/xfsync-watch.sh start ) >/dev/null 2>&1 &
+
+  # ── ⑧ GPU primer (2026-09-29, E-DQ ③-B) ──────────────────────────
+  # 机理(别再重新论证): termux-x11 的 renderer 只有握住真 Android SurfaceView surface 时才
+  #   合成/present(renderer.cpp::shouldWait()), 而 surface 只从 SurfaceHolder.surfaceChanged()
+  #   进来。用户说的"软件渲染"其实【不是】mesa 掉 llvmpipe —— 容器里的 GL 一直是硬件的
+  #   (实测 :2 = Adreno 830 / Accelerated: yes), 是 Android 侧还没把帧 present 出去。
+  # 本 primer 设计用途: surface 一到位、或失焦/重聚焦(surface 重建)后持续请求重绘,
+  #   减少等待 app 自己重绘的延迟; Android 最终呈现效果仍需用户实测。
+  # 本 primer 不能做: surface 根本没来时救不了 —— 由用户手动打开 Termux:X11
+  #   前台窗口; 不自动调用 am start。
+  # 幂等: 脚本自己按 PID + /proc/<pid>/exe 判重, 重复调用只会打 "[=] 已在跑"。
+  # 失败不致命: 后台启动, 输出写 gpu-primer.log; 启动请求不代表已成功运行。
+  # 关掉: GPU_PRIMER=0 startx11
+  # ★ 9>&- <&- 必须有(同 ensure_wm 那条, E-DF/E-EK): 调用方可能持着 flock 的 fd 9,
+  #   primer 是常驻进程, 会【继承】那把锁并永久持有 → 后续所有 flock 等待超时卡死。
+  if [ "${GPU_PRIMER:-1}" = 1 ] && [ "$MODE" != soft ] && [ -x /root/工具箱/sh/x11-gpu-primer.sh ]; then
+    ( GPMR_DISPLAY="$DISP" setsid /root/工具箱/sh/x11-gpu-primer.sh start \
+        >>/root/.cache/desktop-env/gpu-primer.log 2>&1 9>&- <&- & ) 2>/dev/null || true
+    echo "[i] GPU primer 尝试后台启动 (未确认成功; 日志: /root/.cache/desktop-env/gpu-primer.log; 状态: x11-gpu-primer.sh status)"
+  elif [ "${GPU_PRIMER:-1}" != 1 ]; then
+    echo "[i] GPU_PRIMER=0: 跳过 GPU primer"
+  fi
+
   echo "     切到手机上的 Termux:X11 窗口就能看到桌面"
   echo "     ※ VNC(:1) 那套不受影响, 两套独立(铁律12)"
 else
   echo "[✘] $DISP 上没出现 xfce4-session, 日志尾部:"
   tail -20 "$LOG"
+  # ★2026-09-27: 给最常见的那一种失败附上确切修法(根因与判据见本文件 ③′ 段大段注释)
+  if grep -qi 'Another session manager is already running' "$LOG" 2>/dev/null; then
+    echo
+    echo "    ★ 就是这一句: 有别的会话管理器占着 → 本 shell 仍带着 SESSION_MANAGER/ICEAUTHORITY,"
+    echo "      典型来源是【你从 :1 桌面上的终端里跑了 startx11】。本脚本 ③′ 段已会自动剥离;"
+    echo "      若仍报这句, 多半是 :2 上还有上次留下的孤儿会话 → 先 stopx11, 再跑 startx11。"
+  fi
   exit 1
 fi

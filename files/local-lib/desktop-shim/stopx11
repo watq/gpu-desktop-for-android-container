@@ -24,11 +24,11 @@ session_on_display() {
   local d pid dp c
   for d in /proc/[0-9]*; do
     pid=${d#/proc/}
-    c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
-    case "$c" in
-      xfce4-session*|*/xfce4-session*) ;;
-      *) continue ;;
-    esac
+    # ★按 /proc/<pid>/exe 的真实程序名匹配, 不按 cmdline 文本(2026-09-26 改):
+    #   文本匹配会误杀"命令行里恰好提到这些词"的 shell —— 如 bash -c '...xfsettingsd...'
+    #   带着 DISPLAY=:2 就会被当成桌面组件杀掉(2026-09-25 实测 exit 144)。
+    c=$(basename "$(readlink "$d/exe" 2>/dev/null)" 2>/dev/null)
+    [ "$c" = xfce4-session ] || continue
     dp=$( { tr '\0' '\n' < "$d/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)
     [ "$dp" = "$1" ] && echo "$pid"
   done

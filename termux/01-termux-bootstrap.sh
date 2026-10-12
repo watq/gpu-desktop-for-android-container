@@ -42,10 +42,10 @@ mkdir -p "$HOME/.config/gpt_claude_ai"
 chmod 700 "$HOME/.config/gpt_claude_ai"
 cat > "$HOME/.config/gpt_claude_ai/README-放key在这里.txt" <<'EOF'
 把中转站 token 按下面的文件名放进本目录, 每个文件一行纯 token, 然后 chmod 600:
-#   <站点名>-key   你自己的 API 中转站凭据(本仓不含任何凭据与站点信息)
+  agent-key      AgentRouter 站 (域名/端点见 relay-sites.conf, 不在此重复)
   agent1-key     同上, 第二个账号
-#   <站点名>-key   你自己的 API 中转站凭据(本仓不含任何凭据与站点信息)
-  just-key       api.justwoker.icu (可选)
+  anyrouter-key  anyrouter 站 (域名/端点见 relay-sites.conf, 不在此重复)
+  just-key       just 站 (可选, 域名/端点见 relay-sites.conf)
   github-key     GitHub PAT, 仅用于同步本仓库 (可选)
 这些文件【绝对不要】提交到 git 仓库。
 EOF

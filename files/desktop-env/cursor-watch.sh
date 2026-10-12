@@ -22,9 +22,23 @@
 #   cursor-watch.sh start [display…]   为指定 display 起看守(缺省=所有有 xfsettingsd 的)
 #   cursor-watch.sh status             看各 display 的看守状态
 #   cursor-watch.sh stop  [display…]   停掉看守(按 pid 文件, 并校验 /proc/<pid> 确是本脚本)
+#   cursor-watch.sh count [display…]   ★只报"真正的看守主进程"条数(排查重复用, 见下)
 #   cursor-watch.sh __run <display>    内部: 真正的监听循环(别手动调)
 #
-# 幂等: 每个 display 一个实例, pid 文件在 ~/.cache/desktop-env/(不放 /tmp, 免被清)。
+# 幂等: 每个 display 一个实例。两道保险(2026-09-27 加第二道):
+#   ① pid 文件 ~/.cache/desktop-env/cursor-watch.d<N>.pid (不放 /tmp, 免被 00-clean-tmp 清)
+#   ② ★按 display 分开的 flock: ~/.cache/desktop-env/cursor-watch.d<N>.lock
+#      __run 起来先 `flock -n`, 拿不到就【安静退出(码 0, 不写日志)】。
+#      为什么需要②: ①的判据【只看 pid 文件】—— 文件被清掉 / 里面的 pid 被系统回收,
+#      start 就会再起一条真的第二看守。②让这种情况下多起的那条自己静静退掉。
+#
+# ★★数看守条数千万别按 cmdline 文本数(2026-09-27 实测踩过, 白查一轮):
+#   run_loop 里 `xfconf-query -m | while read` 会 fork 出管道右侧子 shell,
+#   它的 /proc/<pid>/cmdline 与主进程【一模一样】(都是 "bash …/cursor-watch.sh __run :N"),
+#   于是 1 条看守被数成 2 条 —— 当时误报 :2 有 11406+32249、:1 有 18936+19747,
+#   实际 32249 的 PPID=11406、19747 的 PPID=18936, 是各自主进程的管道半边, 杀了反而弄坏看守。
+#   正确判据: 主进程是 setsid 起的 → PGID == PID; 管道子 shell 的 PGID != PID。
+#   用 `cursor-watch.sh count` 或 watcher_scan() 来数。
 # ══════════════════════════════════════════════════════════════════════════════
 set -u
 
@@ -44,6 +58,8 @@ mkdir -p "$CACHE" 2>/dev/null
 tag() { printf '%s' "${1#:}" | tr -c 'A-Za-z0-9' '_'; }
 pidf() { printf '%s/cursor-watch.d%s.pid' "$CACHE" "$(tag "$1")"; }
 logf() { printf '%s/cursor-watch.d%s.log' "$CACHE" "$(tag "$1")"; }
+# ★单实例锁【按 display 分开】(全局 GLOCK 是另一回事: 那把是横向推送的互斥锁, 别混用)
+lockf() { printf '%s/cursor-watch.d%s.lock' "$CACHE" "$(tag "$1")"; }
 
 # ── 取某个 display 的会话 D-Bus 地址 ────────────────────────────────────────
 # 从该 display 上跑着的 xfsettingsd 的 /proc/<pid>/environ 里借。
@@ -99,6 +115,30 @@ watcher_alive() {
   c=$( { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null )
   case "$c" in *cursor-watch.sh*__run*) printf '%s' "$p"; return 0 ;; esac
   return 1
+}
+
+# 不依赖 pid 文件, 直接按 /proc 扫出【某 display 上真正的看守主进程】(每行一个 pid)。
+# ★判据三件套(缺一就会误数, 2026-09-27 踩过):
+#   ① exe 真的是 bash/sh/dash (不按 cmdline 文本认程序, 本项目 pgrep -x 踩过 comm 不符的坑)
+#   ② cmdline 含 cursor-watch.sh + __run
+#   ③ ★PGID == PID —— start 是 setsid 起的, 所以主进程必然是进程组长;
+#      而 `xfconf-query -m | while read` 的管道子 shell cmdline 与主进程完全相同,
+#      只能靠 PGID != PID 把它滤掉。少了③就会把 1 条看守数成 2 条。
+#   ④ environ 的 DISPLAY 对上(同 display 才算)
+watcher_scan() {
+  local d="$1" p pid pgid c x
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$pid" = "$$" ] && continue
+    case "$(basename "$(readlink "$p/exe" 2>/dev/null)" 2>/dev/null)" in bash|sh|dash) ;; *) continue ;; esac
+    c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null )
+    case "$c" in *cursor-watch.sh*__run*) ;; *) continue ;; esac
+    # /proc/<pid>/stat: 1 pid, 2 comm, 3 state, 4 ppid, 5 pgrp …(comm 这里无空格, 可直接切词)
+    pgid=$( { read -r _ _ _ _ x _ < "$p/stat"; printf '%s' "$x"; } 2>/dev/null )
+    [ "$pgid" = "$pid" ] || continue
+    [ "$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1 )" = "$d" ] || continue
+    printf '%s\n' "$pid"
+  done
 }
 
 # ── 收到变更后要做的事 ─────────────────────────────────────────────────────
@@ -207,7 +247,16 @@ run_loop() {
 cmd="${1:-status}"; shift 2>/dev/null || true
 case "$cmd" in
   __run)
-    run_loop "${1:?需要 display}"
+    d="${1:?需要 display}"
+    # ★幂等第二道保险: 按 display 的单实例锁。拿不到 = 这个 display 已经有看守在跑
+    #   → 【安静退出, 码 0, 一个字都不写日志】(重复调用不刷日志是硬要求)。
+    #   锁 fd 9 会被本看守自己的管道子进程(xfconf-query -m / while-read 子 shell)继承,
+    #   那是【同一个 open file description】, 不会自锁; 整组退干净锁才释放, 正是想要的。
+    #   start 那边 spawn 时用 9>&- 关掉了【调用方】可能带进来的 fd 9(账本 E-DF 的地雷),
+    #   本行的 exec 是在那之后才开的, 不冲突。
+    exec 9>"$(lockf "$d")" 2>/dev/null || exit 0
+    flock -n 9 || exit 0
+    run_loop "$d"
     ;;
   start)
     set -- ${@:-$(live_displays)}
@@ -217,14 +266,35 @@ case "$cmd" in
         echo "[cursor-watch] $d 已有看守 (pid $p), 跳过"
         continue
       fi
-      # 自成会话 + 断开所有继承的 fd(尤其别继承调用方的 flock 锁 fd, 那会把锁永久占住)
-      setsid nohup "$SELF" __run "$d" >>"$(logf "$d")" 2>&1 </dev/null &
+      # pid 文件被清掉/内容坏了, 但看守进程其实还活着 → 按 /proc 重新认领, 绝不多起一条
+      p=$(watcher_scan "$d" | head -1)
+      if [ -n "$p" ]; then
+        printf '%s\n' "$p" > "$(pidf "$d")"
+        echo "[cursor-watch] $d 已有看守 (pid $p; pid 文件缺失, 已按 /proc 重新认领), 跳过"
+        continue
+      fi
+      # 自成会话 + 断开所有继承的 fd(尤其别继承调用方的 flock 锁 fd 9, 那会把锁永久占住)
+      setsid nohup "$SELF" __run "$d" >>"$(logf "$d")" 2>&1 </dev/null 9>&- &
       sleep 1
       if p=$(watcher_alive "$d"); then
         echo "[cursor-watch] $d 看守已启动 (pid $p), 日志 $(logf "$d")"
       else
-        echo "[cursor-watch] $d 看守启动失败, 看 $(logf "$d")"
+        p=$(watcher_scan "$d" | head -1)
+        if [ -n "$p" ]; then
+          printf '%s\n' "$p" > "$(pidf "$d")"
+          echo "[cursor-watch] $d 看守已启动 (pid $p), 日志 $(logf "$d")"
+        else
+          echo "[cursor-watch] $d 看守启动失败, 看 $(logf "$d")"
+        fi
       fi
+    done
+    ;;
+  count)
+    set -- ${@:-$(live_displays)}
+    for d in "$@"; do
+      p=$(watcher_scan "$d" | tr '\n' ' ')
+      n=$(printf '%s' "$p" | wc -w)
+      printf '  %s: 看守主进程 %s 条  pid=[%s]\n' "$d" "$n" "${p% }"
     done
     ;;
   stop)
@@ -248,6 +318,8 @@ case "$cmd" in
   status)
     for d in $(live_displays); do
       if p=$(watcher_alive "$d"); then echo "  $d: 看守在跑 pid=$p"; else echo "  $d: 无看守"; fi
+      n=$(watcher_scan "$d" | wc -l)
+      [ "$n" = 1 ] || echo "      ★ /proc 实扫到 $n 条看守主进程 (应为 1): $(watcher_scan "$d" | tr '\n' ' ')"
       b="$(bus_of_display "$d")" || b="(取不到)"
       echo "      总线 $b"
       echo -n "      xfconf: "
@@ -259,6 +331,6 @@ case "$cmd" in
       echo -n "      xrdb:   "; env "DISPLAY=$d" timeout 10 xrdb -query 2>/dev/null | grep -i '^Xcursor' | tr '\n' ' '; echo
     done
     ;;
-  *) sed -n '28,36p' "$SELF"; exit 1 ;;
+  *) sed -n '/^# 用法:/,/^# ★★数看守条数/p' "$SELF" | sed '$d'; exit 1 ;;
 esac
 exit 0

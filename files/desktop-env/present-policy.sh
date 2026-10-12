@@ -62,7 +62,7 @@
 #   VLC(包装)      :1  xcb_x11, kgsl-fd 0, 只映射 libavcodec              320  ★0  24.0  0   19%
 #   VLC(包装)      :2  xcb_x11, kgsl-fd 0, 只映射 libavcodec              320  ★0  23.9  0   43%
 #   深度影院 全屏  :1  Vulkan + WSI=sw, kgsl-fd 1 (2504x1152)             320  ★0  23.9  0   31%
-#   深度影院 全屏  :2  Vulkan 原生 DRI3, kgsl-fd 1 (1280x1024)            320  ★0  24.0  0   19%
+#   深度影院 全屏  :2  Vulkan 原生 DRI3, kgsl-fd 1 (1280x1024, 当时尺寸)            320  ★0  24.0  0   19%
 #   麒麟影院 全屏  :2  zink(本文件绕法③), kgsl-fd 1                       320  ★0   —    —   18%
 #      └ 同条件修前(PRESENT_POLICY=0 → kgsl GL): ★整帧黑 74/320 + 撕裂 10 + 码倒退 19
 #   麒麟影院       :1  ★未通过: 有 CPU(30%)有 Vulkan 但【一帧都不上屏】(320 张逐字节全同, 唯一色 89)

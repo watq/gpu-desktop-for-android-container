@@ -176,19 +176,51 @@ _target_state() {
   return 0
 }
 
-# ── 某路径归哪个【已安装】dpkg 包; 无主/查不了则输出空 ──
-#    ★ merged-usr: command -v 可能给出 /bin/xxx, 而 dpkg 记的是 /usr/bin/xxx, 直接查会假装"无主"
-#      → 查不到就再用 readlink -f 归一化后查一次, 避免把有主的东西误判成残留。
+# ── 精确路径 + 完整包名(含架构) + installed 状态；查询异常时保守保留 ──
+# dpkg-query -S 接受 glob，不能把首个近似匹配当作归属；残配 rc 也不算安装。
+# 非空 @unknown 表示无法可靠判断，阻止 R3 删除。合并 /usr 路径也核对。
 _dpkg_owner() {
-  local p="$1" out rp
-  [ -n "$p" ] || return 0
-  command -v dpkg-query >/dev/null 2>&1 || return 0
-  out=$(dpkg-query -S "$p" 2>/dev/null | head -n1)
-  if [ -z "$out" ]; then
-    rp=$(readlink -f -- "$p" 2>/dev/null)
-    [ -n "$rp" ] && [ "$rp" != "$p" ] && out=$(dpkg-query -S "$rp" 2>/dev/null | head -n1)
-  fi
-  [ -n "$out" ] && printf '%s\n' "${out%%:*}"
+  local p="$1" rp candidate out rc line owners listed pkg status matched unknown=0
+  local -a paths=() packages=()
+  [ -n "$p" ] || { printf '@unknown\n'; return 0; }
+  command -v dpkg-query >/dev/null 2>&1 || { printf '@unknown\n'; return 0; }
+  case "$p" in
+    /*) ;;
+    */*) printf '@unknown\n'; return 0 ;;
+    *) p=$(command -v -- "$p" 2>/dev/null) || { printf '@unknown\n'; return 0; } ;;
+  esac
+  paths+=("$p")
+  rp=$(readlink -f -- "$p" 2>/dev/null)
+  [ -n "$rp" ] && [ "$rp" != "$p" ] && paths+=("$rp")
+  for candidate in "${paths[@]}"; do
+    out=$(dpkg-query -S -- "$candidate" 2>/dev/null); rc=$?
+    if [ "$rc" -gt 1 ]; then unknown=1; continue; fi
+    matched=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      case "$line" in *': '*) ;; *) unknown=1; continue ;; esac
+      listed=${line#*: }
+      [ "$listed" = "$candidate" ] || continue
+      matched=1
+      owners=${line%%: *}
+      IFS=',' read -r -a packages <<< "$owners"
+      for pkg in "${packages[@]}"; do
+        pkg="${pkg#"${pkg%%[![:space:]]*}"}"
+        pkg="${pkg%"${pkg##*[![:space:]]}"}"
+        [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9][a-z0-9-]*)?$ ]] || { unknown=1; continue; }
+        status=$(dpkg-query -W -f='${Status}' -- "$pkg" 2>/dev/null); rc=$?
+        if [ "$rc" != 0 ]; then unknown=1; continue; fi
+        case "$status" in
+          'install ok installed'|'hold ok installed') printf '%s\n' "$pkg"; return 0 ;;
+          *' not-installed'|*' config-files') ;;
+          *) unknown=1 ;; # 半安装、损坏或空输出不授权清理
+        esac
+      done
+    done <<< "$out"
+    # 成功但没有精确归属记录属于异常，不能视为已确认无主。
+    [ "$rc" != 0 ] || [ "$matched" = 1 ] || unknown=1
+  done
+  [ "$unknown" = 0 ] || printf '@unknown\n'
   return 0
 }
 

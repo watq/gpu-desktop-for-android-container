@@ -17,6 +17,7 @@ export DISPLAY="${DISPLAY:-:1}"
 #   原来是先 source 再 BIN="$1", 探测不到版本只能回落保守档。
 [ $# -ge 1 ] || { echo "electron-wrap: 缺少可执行文件参数" >&2; exit 2; }
 BIN="$1"; shift
+[ -x "$BIN" ] || { printf 'Electron 应用不存在，未加载用户注入: %s\n' "$BIN" >&2; exit 127; }
 export ELECTRON_BIN="$BIN"
 
 [ -r /root/.config/desktop-env/gpu.sh ] && . /root/.config/desktop-env/gpu.sh

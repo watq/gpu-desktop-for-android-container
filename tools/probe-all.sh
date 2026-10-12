@@ -13,11 +13,10 @@
 #   · ★不做全盘 find(会卡死 proot), 一律 bounded(-maxdepth)
 # ════════════════════════════════════════════════════════════════════════════
 set -u
-OUT=/tmp/probe-out
+OUT="${PROBE_OUTDIR:-/tmp/probe-out}"
 MAXJOBS=6
-mkdir -p "$OUT"
 
-PROBES="gl_paths vk_present displays apps_entry locale_l10n spark_store linglong services vnc_state electron_hooks aria2 disk_pkg"
+PROBES="gl_paths vk_present displays apps_entry overlay_shims locale_l10n spark_store linglong services vnc_state electron_hooks aria2 disk_pkg"
 
 # ── 小工具 ──
 sec() { printf '\n--- %s ---\n' "$1"; }
@@ -113,6 +112,88 @@ probe_apps_entry() {
   timeout 10 /usr/bin/vlc --version 2>&1 | head -3 | sed 's/^/      /'
 }
 
+# ── U11: 覆盖式垫片断言（只读，不改 PATH、不执行被测命令） ──
+# 后两个参数是允许的入口目录；生产调用固定用户 bin 与兼容 bin。
+# 除入口目录外还核对最终本体，防止“位置对但软链被包更新指回裸程序”。
+check_overlay_entry() {
+  local name="$1" body="$2" user_bin="$3" compat_bin="$4" entry actual
+  entry=$(command -v "$name" 2>/dev/null) || entry=""
+  if [ -z "$entry" ]; then
+    printf '[FAIL] %s: 当前 PATH 找不到命令\n' "$name"
+    return 1
+  fi
+  if [ "$entry" != "$user_bin/$name" ] && [ "$entry" != "$compat_bin/$name" ]; then
+    printf '[FAIL] %s: 解析到 %s，绕过用户垫片\n' "$name" "$entry"
+    return 1
+  fi
+  actual=$(/usr/bin/readlink -f -- "$entry" 2>/dev/null) || actual=""
+  if [ ! -x "$entry" ] || [ "$actual" != "$body" ]; then
+    printf '[FAIL] %s: %s -> %s；预期 %s\n' "$name" "$entry" "${actual:-<断链>}" "$body"
+    return 1
+  fi
+  printf '[OK] %s: %s -> %s\n' "$name" "$entry" "$actual"
+}
+
+# ★2026-10-06 扩面(U11 第二棒): 原来只列了 SHIM_OF 里"双落点"的 6 项, 但用一次【真的 PATH 全扫】
+#   (wip/localbin2.20261003/scan-overlay-shims*.sh: 遍历 PATH 各目录, 找同名命令出现 >=2 次
+#   且 readlink -f 本体不同者) 查出【12 项】是覆盖式, 而且漏掉的那 6 项恰恰是【只有一个落点】的
+#   —— 它们比 pkexec 更脆: pkexec 在 /root/.local/bin 和 /usr/local/bin 各有一份, 坏一个还有另一个;
+#   单落点的那些, /root/.local/bin 一旦掉出 PATH 就【直接静默退回系统原程序】, 毫无冗余。
+#   所以断言必须覆盖单落点组, 否则防的是最不容易坏的那个。
+#   不列入的只有 Xtigervnc(/usr/local/bin 的真文件遮 /usr/bin/Xtigervnc) —— 那是 VNC 自编版本
+#   的有意覆盖, 不是用户级垫片, 不归本断言管。
+#   aptss / ssinstall / spark-store / apm 也不在此列: 它们的系统入口【本身就指同一个垫片】,
+#   不靠 PATH 顺序取胜, 属 relink.sh 自愈范围(见 ~/.local/lib/spark-shim/relink.sh)。
+OVERLAY_DUAL="pkexec deepin-music firefox linglong-store lx-music-desktop vlc"
+OVERLAY_SOLO="deepin-movie kylin-video-new mpv xfconf-query thunar Thunar"
+overlay_body_of() {   # 名字 -> 期望本体
+  case "$1" in
+    pkexec)           printf '%s' /root/.local/lib/pkexec-shim/pkexec ;;
+    deepin-music)     printf '%s' /root/.local/lib/deepin-music-shim/deepin-music-wrap.sh ;;
+    firefox)          printf '%s' /root/.local/lib/firefox-shim/firefox-wrap.sh ;;
+    linglong-store)   printf '%s' /root/.local/lib/linglong-shim/linglong-wrap.sh ;;
+    lx-music-desktop) printf '%s' /root/.local/lib/lx-music-shim/lx-music-wrap.sh ;;
+    vlc)              printf '%s' /root/工具箱/sh/vlc-wrap.sh ;;
+    deepin-movie)     printf '%s' /root/.local/lib/desktop-shim/deepin-movie-wrap.sh ;;
+    kylin-video-new)  printf '%s' /root/工具箱/sh/kylin-video-wrap.sh ;;
+    mpv)              printf '%s' /root/工具箱/sh/mpv-wrap.sh ;;
+    xfconf-query)     printf '%s' /root/工具箱/sh/xfconf-safe.sh ;;
+    thunar|Thunar)    printf '%s' /root/.local/lib/thunar-shim/thunar ;;
+    *)                printf '' ;;
+  esac
+}
+
+probe_overlay_shims() {
+  printf '目的: 检查当前 PATH 是否仍命中覆盖式垫片及正确本体\n'
+  local name body failed=0 total=0
+  sec "PATH 顺序(覆盖式垫片的命门; /root/.local/bin 必须在 /usr/bin 之前)"
+  printf '    %s\n' "$PATH"
+  case ":$PATH:" in
+    *:/root/.local/bin:*) : ;;
+    *) printf '[FAIL] PATH 里根本没有 /root/.local/bin —— 所有用户级垫片都已失效\n'; failed=$((failed+1)) ;;
+  esac
+
+  sec "双落点组(/root/.local/bin + /usr/local/bin 各一份, 坏一个还有冗余)"
+  for name in $OVERLAY_DUAL; do
+    total=$((total+1)); body=$(overlay_body_of "$name")
+    check_overlay_entry "$name" "$body" /root/.local/bin /usr/local/bin || failed=$((failed+1))
+  done
+
+  sec "单落点组(只有 /root/.local/bin 一份, ★无冗余, 最脆)"
+  for name in $OVERLAY_SOLO; do
+    total=$((total+1)); body=$(overlay_body_of "$name")
+    check_overlay_entry "$name" "$body" /root/.local/bin /usr/local/bin || failed=$((failed+1))
+  done
+
+  printf '\n覆盖式垫片: %s 项，失败 %s 项\n' "$total" "$failed"
+  if [ "$failed" -ne 0 ]; then
+    printf '★ 覆盖式垫片靠 PATH 顺序取胜, FAIL 多半是 PATH 被改动(谁把 /usr/bin 提前了)。\n'
+    printf '  查: ~/.bashrc:105 的 export PATH, 以及 Termux 侧 /root/Termux目录/start.sh 传进来的 PATH。\n'
+  fi
+  [ "$failed" -eq 0 ]
+}
+# ── U11 结束 ──
+
 probe_locale_l10n() {
   echo "目的: 汉化现状(locale + 各应用 zh_CN 翻译文件在不在)"
   sec "locale"
@@ -131,9 +212,22 @@ probe_locale_l10n() {
 probe_spark_store() {
   echo "目的: 星火商店可用性 + 我加的钩子是否还在"
   sec "主程序与安装器"
-  for b in /usr/local/bin/spark-store /opt/spark-store/bin/spark-store /usr/bin/ssinstall /usr/bin/aptss /usr/local/bin/apm; do
+  # ★2026-09-28 改: 真入口已搬到 /root/.local/bin/spark-store(PATH 第 1 位), 本体是
+  #   ~/.local/lib/spark-shim/spark-store-wrap.sh(4533B)。原来只探 /usr/local/bin/spark-store,
+  #   而那个路径今天被一次误还原塞回了 09-24 的【旧壳】(2046B) —— 探针于是"误报通过、且测的是旧壳",
+  #   比报"没装"更坏。新入口排第一位; 旧路径仍列出但标注它可能是旧壳。
+  for b in /root/.local/bin/spark-store /root/.local/lib/spark-shim/spark-store-wrap.sh /usr/local/bin/spark-store /opt/spark-store/bin/spark-store /usr/bin/ssinstall /usr/bin/aptss /usr/local/bin/apm; do
     printf '    %s : %s\n' "$([ -e "$b" ] && echo 有 || echo 缺)" "$b"
   done
+  sec "★spark-store 真正解析到哪(PATH 第 1 位优先)"
+  printf '    command -v spark-store -> %s\n' "$(command -v spark-store 2>/dev/null || echo 无)"
+  for b in /root/.local/bin/spark-store /root/.local/lib/spark-shim/spark-store-wrap.sh /usr/local/bin/spark-store; do
+    [ -e "$b" ] || continue
+    printf '    %-52s %6s字节  md5=%.8s%s\n' "$b" "$(stat -Lc %s "$b" 2>/dev/null)" \
+      "$(md5sum < "$b" 2>/dev/null)" "$([ -L "$b" ] && echo "  → $(readlink "$b")")"
+  done
+  echo "    ※ /usr/local/bin/spark-store 若是 2046B 且自述 2026-09-24, 那是旧壳(见账本 E-EJ), 不是现行本体"
+
   sec "/usr/bin/ssinstall 是我的包装还是符号链接"
   head -4 /usr/bin/ssinstall 2>/dev/null | sed 's/^/    /'
   sec "真身未被改动核验"
@@ -252,9 +346,12 @@ probe_disk_pkg() {
 # ════════ 调度 ════════
 case "${1:-}" in
   --list) echo "可用探针:"; for p in $PROBES; do echo "  $p"; done; exit 0 ;;
+  # 单项断言直接返回状态码；不启动 GUI，也不生成 /tmp 诊断文件。
+  overlay_shims) probe_overlay_shims; exit $? ;;
   "") TARGETS="$PROBES" ;;
   *) TARGETS="$1" ;;
 esac
+mkdir -p "$OUT"
 
 echo "并发诊断开始 (上限 ${MAXJOBS} 个) …"
 n=0

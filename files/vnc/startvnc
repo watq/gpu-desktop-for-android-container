@@ -114,7 +114,7 @@ fi
 # ── 起 Xvnc ──
 echo "[i] $(basename "$XVNC")  $DISP  ${VNC_GEOM}  dpi=${VNC_DPI}  port=${PORT}"
 LD_PRELOAD=/lib/aarch64-linux-gnu/libgcc_s.so.1 \
-"$XVNC" "$DISP" \
+/root/.local/lib/vnc-shim/xvnc-local-wrap.sh "$XVNC" "$DISP" \
   -localhost=1 \
   -desktop remote-desktop \
   -rfbport "$PORT" \
@@ -123,6 +123,7 @@ LD_PRELOAD=/lib/aarch64-linux-gnu/libgcc_s.so.1 \
   -auth /root/.Xauthority \
   -geometry "$VNC_GEOM" \
   -depth 24 \
+  -CompareFB 0 \
   -dpi "$VNC_DPI" \
   >"$LOG" 2>&1 &
 XVNC_PID=$!
