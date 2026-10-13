@@ -24,7 +24,20 @@ if [ "${X11_ON:-1}" = 1 ] && command -v termux-x11 >/dev/null 2>&1; then
     #   黑屏只有鼠标光标 → -legacy-drawing   颜色错乱 → -force-bgra
     #   2026-09-23 默认开 -legacy-drawing: 本机实测 :2 桌面进程全活但画面黑屏只有光标。
     #   不想要就跑 X11_EXTRA= ./start.sh  (置空即可)
-    termux-x11 :2 -dpi 96 ${X11_EXTRA--legacy-drawing} &
+    # ★2026-10-12 加 X11_LOG(排错用): 过期副本 /root/start.sh(93 行, 已删)唯一值得捞回来的
+    #   就是这一点 —— 把 termux-x11 的输出留一份, 否则黑屏/报错时什么线索都没有。
+    #   · 用 > 截断而非 >> 追加: 每次启动只留本次, 不会无限长大。
+    #   · 日志落 $PREFIX/tmp —— 它就是绑进 proot 的 /tmp, 所以【容器内直接看 /tmp/termux-x11.log】。
+    #     被 00-clean-tmp 清掉也无所谓, 下次启动自动重建。
+    #   · ★绝不照抄老副本那行 export XDG_RUNTIME_DIR —— 用户实测加了它 socket 根本建不起来。
+    #   · X11_LOG= 置空 → 不记日志, 回到原行为;  X11_LOG=/别处/x.log 可改路径。
+    _x11log="${X11_LOG-$PREFIX/tmp/termux-x11.log}"
+    if [ -n "$_x11log" ]; then
+      termux-x11 :2 -dpi 96 ${X11_EXTRA--legacy-drawing} >"$_x11log" 2>&1 &
+    else
+      termux-x11 :2 -dpi 96 ${X11_EXTRA--legacy-drawing} &
+    fi
+    unset _x11log
     disown 2>/dev/null || true
     # 轮询等 socket(机型起身速度不同), 最多 X11_WAIT 秒; ★不用 am start(用户明确不要)
     W=0; MAX=${X11_WAIT:-8}
