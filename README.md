@@ -1,5 +1,17 @@
 # 手机上的硬件加速 Linux 桌面
 
+## 2026-10-27 当前 GPU 状态
+
+当前验证版本为 Mesa **27.0.0-devel-20261025**（`6f90e92dfd`），Ubuntu Noble arm64 官方包 SHA256：`0d3928ac6dd102c864311167c0585ce5632b2e4e456985d94b8ab9fdea2339f8`。恢复脚本默认此版本并在解包前校验，六个 Mesa 核心包继续 apt hold。
+
+- 同条件旧26→新27→旧26，原生GL视频黑帧为14/240→0/240→14/240。安装后GL/Vulkan双显示短测通过；下文旧黑帧实验保留为历史，不再表示新版仍有同一故障。不能只凭该对照将修复唯一归因到某一个提交。
+- 原生KGSL现为GL4.3/GLES3.2，Zink仍GL4.6。上游为KGSL缓存一致性关闭persistent coherent mapping，缺GL_ARB_buffer_storage；不伪造版本。
+- VNC原生Vulkan仍需`MESA_VK_WSI_DEBUG=sw`；星火GPU合成花屏及patched picom/XRender兼容措施继续保留。
+- use1/use2按现役显示服务选择驱动，尊重软件请求，use2只撤销helper自己设置的WSI。最终软件与WSI分流独立离线复核28/28通过。
+- GPU渲染通过不等于视频硬解；TermuxVA宿主未部署。小窗/息屏系统调度、手机最终VNC画面与60fps仍待验。
+- 本机共享显示/零拷贝仅为独立实验，未接入当前生产桌面。
+
+
 **简体中文** | [English](docs/en/README.md)
 
 ---
@@ -207,7 +219,7 @@ tools/make-hidpi-cursor.py vintage vintage-hidpi 24,32,48,64,96,128
 files/desktop-env/cursor-sync.sh :1 :2
 ```
 
-## 视频播放：黑帧的真凶是缺围栏
+## 视频播放：旧版黑帧与围栏调查（Mesa27修复前）
 
 走 GPU 呈现时视频会整帧全黑。定位这件事的难点在**判据**——`xwd`/`XGetImage` 抓到的黑，到底是真黑还是抓帧伪影？
 

@@ -1,6 +1,6 @@
 # desktop-env/display.sh —— 显示目标切换 (VNC :1 与 Termux:X11 :2 两套独立, 不合并)
-# use1 → VNC(:1): GL 走软件(llvmpipe, VNC 无 DRI3); Vulkan 仍硬件(Turnip)
-# use2 → Termux:X11(:2): 开 kgsl 让 GL 也走硬件(旧机此路可用; 新机待实测)
+# use1 → 当前DRI3 VNC(:1): KGSL硬件GL，Vulkan保留WSI兼容；原版/软件模式不强开硬件
+# use2 → Termux:X11(:2): KGSL硬件GL；尊重明确的软件渲染请求
 #
 # ★2026-09-27 改: 原来只判 `[ -e /tmp/.X11-unix/X1 ]` = socket 文件存在。
 #   但 socket 会**残留**(Xvnc 死了文件还在, startvnc 第 66 行就是专门清这种残留的),
@@ -45,7 +45,68 @@ if [ -z "${DISPLAY:-}" ] || [ "$DISPLAY" = ":0" ]; then
   fi
   unset _d1_ok _d1pid
 fi
-use1() { export DISPLAY=:1; unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
-         echo "[切换] VNC(:1): GL=软件/llvmpipe, Vulkan=硬件"; }
-use2() { export DISPLAY=:2; export MESA_LOADER_DRIVER_OVERRIDE=kgsl EGL_PLATFORM=x11 LIBGL_ALWAYS_SOFTWARE=0
-         echo "[切换] Termux:X11(:2): GL 尝试 kgsl 硬件"; }
+# Explicit display switches: select the server profile, not a cached renderer name.
+_display_soft_requested() {
+  [ "${GPU_OFF:-0}" = 1 ] && return 0
+  case "${LIBGL_ALWAYS_SOFTWARE:-0}" in 1|true|TRUE|yes|YES|on|ON) return 0 ;; esac
+  case "${GALLIUM_DRIVER:-}:${MESA_LOADER_DRIVER_OVERRIDE:-}" in
+    llvmpipe:*|softpipe:*|*:llvmpipe|*:softpipe|*:swrast) return 0 ;;
+  esac
+  return 1
+}
+_display_wsi_vnc() {
+  # Track only the value installed by this helper, so user overrides survive.
+  if [ -z "${MESA_VK_WSI_DEBUG+x}" ]; then
+    export MESA_VK_WSI_DEBUG=sw
+    _DISPLAY_SWITCH_WSI=sw
+  fi
+}
+_display_wsi_x11() {
+  if [ "${_DISPLAY_SWITCH_WSI:-}" = sw ] && [ "${MESA_VK_WSI_DEBUG:-}" = sw ]; then
+    unset MESA_VK_WSI_DEBUG
+  fi
+  unset _DISPLAY_SWITCH_WSI
+}
+use1() {
+  local pid='' server='' server_soft=0
+  export DISPLAY=:1
+  if [ -r /root/.vnc/localhost:1.pid ]; then
+    read -r pid < /root/.vnc/localhost:1.pid
+    case "$pid" in ''|*[!0-9]*) pid='' ;; esac
+    if [ -n "$pid" ]; then
+      server=$(readlink "/proc/$pid/exe" 2>/dev/null) || server=''
+      if [ -r "/proc/$pid/environ" ] &&
+         tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qx 'LIBGL_ALWAYS_SOFTWARE=1'; then
+        server_soft=1
+      fi
+    fi
+  fi
+  _display_wsi_vnc
+  if _display_soft_requested || [ "$server_soft" = 1 ]; then
+    export LIBGL_ALWAYS_SOFTWARE=1
+    unset MESA_LOADER_DRIVER_OVERRIDE
+    case "${GALLIUM_DRIVER:-}" in kgsl|zink) unset GALLIUM_DRIVER ;; esac
+    echo '[切换] VNC(:1)：保留软件渲染模式'
+  elif [ "$server" = /usr/local/bin/Xtigervnc-dri3 ]; then
+    export MESA_LOADER_DRIVER_OVERRIDE=kgsl EGL_PLATFORM=x11 LIBGL_ALWAYS_SOFTWARE=0 TU_DEBUG=noconform
+    unset GALLIUM_DRIVER
+    echo '[切换] VNC(:1)：KGSL硬件GL；Vulkan使用现有WSI兼容设置'
+  else
+    unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
+    echo '[切换] VNC(:1)：未确认DRI3服务端，使用默认驱动；实际渲染器需查询'
+  fi
+}
+use2() {
+  export DISPLAY=:2
+  _display_wsi_x11
+  if _display_soft_requested; then
+    export LIBGL_ALWAYS_SOFTWARE=1
+    unset MESA_LOADER_DRIVER_OVERRIDE
+    case "${GALLIUM_DRIVER:-}" in kgsl|zink) unset GALLIUM_DRIVER ;; esac
+    echo '[切换] Termux:X11(:2)：保留软件渲染请求'
+  else
+    export MESA_LOADER_DRIVER_OVERRIDE=kgsl EGL_PLATFORM=x11 LIBGL_ALWAYS_SOFTWARE=0 TU_DEBUG=noconform
+    unset GALLIUM_DRIVER
+    echo '[切换] Termux:X11(:2)：KGSL硬件GL'
+  fi
+}

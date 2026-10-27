@@ -327,11 +327,11 @@ probe_disk_pkg() {
   echo "目的: 磁盘与关键包状态"
   sec "磁盘"
   df -h / 2>/dev/null | sed 's/^/    /'
-  sec "Mesa 真实版本(别信 dpkg, tarball 覆盖装不更新 dpkg)"
+  sec "磁盘Mesa库版本（含回滚保留库；不等于应用实际加载版本）"
   for so in /usr/lib/aarch64-linux-gnu/libgallium-*.so /usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so; do
     [ -f "$so" ] && printf '    %-55s %s\n' "$(basename "$so")" "$(strings -a "$so" 2>/dev/null | grep -m1 -oE 'Mesa [0-9][^ ]*')"
   done
-  sec "kgsl 后端计数(0=当前 Mesa 不支持本机 GPU)"
+  sec "KGSL静态线索（字符串计数不能代替GPU绘制验证）"
   printf '    libvulkan_freedreno kgsl 命中: %s\n' "$(strings /usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so 2>/dev/null | grep -ic kgsl)"
   printf '    kgsl_dri.so : %s\n' "$([ -f /usr/lib/aarch64-linux-gnu/dri/kgsl_dri.so ] && echo 有 || echo 缺)"
   sec "被 hold 的包"

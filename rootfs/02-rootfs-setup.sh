@@ -210,13 +210,23 @@ elif already_built && ! force_on; then
 else
   GPU_MODEL=$(cat /sys/class/kgsl/kgsl-3d0/gpu_model 2>/dev/null || echo "未知")
   echo "   本机 GPU: $GPU_MODEL"
-  MESA_VER="${MESA_VER:-26.3.0-devel-20260824}"
+  MESA_VER="${MESA_VER:-27.0.0-devel-20261025}"
   MESA_TAG="${MESA_TAG:-mesa-$MESA_VER}"
   PKG="mesa-for-android-container_${MESA_VER}_ubuntu_noble_arm64.tar.gz"
   URL="https://github.com/lfdevs/mesa-for-android-container/releases/download/$MESA_TAG/$PKG"
   mkdir -p /root/工具箱/mesa-aac && cd /root/工具箱/mesa-aac
-  if [ ! -f "$PKG" ]; then echo "   下载 $PKG"; curl -sL -o "$PKG" "$URL" || { echo "   ✘ 下载失败, 跳过 GPU"; SKIP_GPU=1; }; fi
+  if [ ! -f "$PKG" ]; then echo "   下载 $PKG"; curl -fL --retry 2 -o "$PKG" "$URL" || { echo "   ✘ 下载失败, 跳过 GPU"; SKIP_GPU=1; }; fi
   if [ "$SKIP_GPU" != "1" ] && [ -s "$PKG" ]; then
+    # Verify the exact tested Noble release before any extraction or backup mutation.
+    MESA_EXPECTED_SHA256="${MESA_SHA256:-}"
+    if [ -z "$MESA_EXPECTED_SHA256" ] && [ "$MESA_VER" = 27.0.0-devel-20261025 ] && [ "$MESA_TAG" = mesa-27.0.0-devel-20261025 ]; then
+      MESA_EXPECTED_SHA256=0d3928ac6dd102c864311167c0585ce5632b2e4e456985d94b8ab9fdea2339f8
+    fi
+    case "$MESA_EXPECTED_SHA256" in
+      ''|*[!0-9a-fA-F]*) echo '   ✘ 指定版本缺少有效MESA_SHA256，停止GPU恢复' >&2; exit 1 ;;
+    esac
+    [ "${#MESA_EXPECTED_SHA256}" -eq 64 ] || { echo '   ✘ MESA_SHA256长度无效' >&2; exit 1; }
+    printf '%s  %s\n' "$MESA_EXPECTED_SHA256" "$PKG" | sha256sum --check --status || { echo '   ✘ Mesa下载包校验失败，停止GPU恢复' >&2; exit 1; }
     tar -tzf "$PKG" > "$BK/mesa-aac-filelist.txt"
     # 记录将被覆盖的原文件, 打成回退包
     rm -rf stage && mkdir stage && tar -xzf "$PKG" -C stage
