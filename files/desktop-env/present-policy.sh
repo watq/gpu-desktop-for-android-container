@@ -125,6 +125,19 @@ present_policy_env() {
 
 present_policy_gl_safe() {
     [ "${PRESENT_POLICY:-1}" = 0 ] && return 0
+    # Software requests take precedence over this historical GL compatibility path.
+    local software=0
+    [ "${GPU_OFF:-0}" = 1 ] && software=1
+    case "${LIBGL_ALWAYS_SOFTWARE:-}" in 1|true|TRUE|yes|YES|on|ON) software=1 ;; esac
+    case "${GALLIUM_DRIVER:-}:${MESA_LOADER_DRIVER_OVERRIDE:-}" in
+        llvmpipe:*|softpipe:*|*:llvmpipe|*:softpipe|*:swrast) software=1 ;;
+    esac
+    if [ "$software" = 1 ]; then
+        export LIBGL_ALWAYS_SOFTWARE=1
+        case "${GALLIUM_DRIVER:-}" in kgsl|zink) unset GALLIUM_DRIVER ;; esac
+        case "${MESA_LOADER_DRIVER_OVERRIDE:-}" in kgsl|zink) unset MESA_LOADER_DRIVER_OVERRIDE ;; esac
+        return 0
+    fi
     export MESA_LOADER_DRIVER_OVERRIDE=zink
     export LIBGL_ALWAYS_SOFTWARE=0
     present_policy_env
